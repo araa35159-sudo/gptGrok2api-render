@@ -22,6 +22,20 @@ import (
 	"github.com/auucoder/gptgrok2api-go/internal/provider"
 )
 
+func TestImageWorkContextSurvivesClientDisconnect(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	ctx, cancel := context.WithCancel(request.Context())
+	request = request.WithContext(ctx)
+	workCtx, workCancel := imageWorkContext(request, 10*time.Second)
+	defer workCancel()
+	cancel()
+	select {
+	case <-workCtx.Done():
+		t.Fatalf("image work canceled with client request: %v", workCtx.Err())
+	default:
+	}
+}
+
 func TestValidOpenAIImageSizeAcceptsArbitraryDimensions(t *testing.T) {
 	for _, value := range []string{"864x1152", "1800x2400", "123x456"} {
 		if !validOpenAIImageSize(value) {
@@ -31,6 +45,15 @@ func TestValidOpenAIImageSizeAcceptsArbitraryDimensions(t *testing.T) {
 	for _, value := range []string{"0x100", "abc", "100"} {
 		if validOpenAIImageSize(value) {
 			t.Fatalf("accepted %s", value)
+		}
+	}
+}
+
+func TestOpenAIImageRatioSizesNormalizeBeforeValidation(t *testing.T) {
+	for _, value := range []string{"1:1", "3:4", "4:3", "9:16", "16:9", "1024×1536"} {
+		normalized := provider.NormalizeOpenAIImageSize(value)
+		if !validOpenAIImageSize(normalized) {
+			t.Fatalf("normalized size %q from %q is invalid", normalized, value)
 		}
 	}
 }
@@ -184,6 +207,29 @@ func TestUpstreamStatusMapsDeadlineToGatewayTimeout(t *testing.T) {
 	}
 }
 
+func TestUpstreamStatusMapsClientCancellationTo499(t *testing.T) {
+	if status := upstreamStatus(fmt.Errorf("client disconnected: %w", context.Canceled)); status != 499 {
+		t.Fatalf("expected client cancellation status 499, got %d", status)
+	}
+}
+
+func TestImageBatchErrorIgnoresSiblingCancellation(t *testing.T) {
+	parent := context.Background()
+	operation, cancel := context.WithCancel(parent)
+	cancel()
+
+	got := chooseImageBatchError([]error{
+		fmt.Errorf("worker stopped: %w", context.Canceled),
+		errors.New("invalid image size"),
+	}, parent, operation)
+	if got == nil || got.Error() != "invalid image size" {
+		t.Fatalf("expected the real worker error, got %v", got)
+	}
+	if !isSiblingImageCancellation(fmt.Errorf("worker stopped: %w", context.Canceled), parent, operation) {
+		t.Fatal("expected sibling cancellation to be identified")
+	}
+}
+
 func TestEditableFileDownloadRequiresValidSignature(t *testing.T) {
 	root := t.TempDir()
 	fileRoot := filepath.Join(root, "files")
@@ -300,6 +346,8 @@ func TestImageGenerationsRunsOpenAIBatchesConcurrently(t *testing.T) {
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			inflight.Add(-1)
+		case "/backend-api/conversation/conversation-1":
+			writeHTTPAPIGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
 		case "/blob":
@@ -375,6 +423,8 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://%s\",\"file-service://%s\"]}}}\n\n", fileIDs[0], fileIDs[1])
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-1":
+			writeHTTPAPIGeneratedImageConversation(w, fileIDs...)
 		case "/backend-api/files/" + fileIDs[0] + "/download", "/backend-api/files/" + fileIDs[1] + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
 		case "/blob":
@@ -443,4 +493,15 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 	if stored != 2 {
 		t.Fatalf("expected one persisted image per request, got %d total", stored)
 	}
+}
+
+func writeHTTPAPIGeneratedImageConversation(w http.ResponseWriter, fileIDs ...string) {
+	parts := make([]any, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		parts = append(parts, map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fileID})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"tool-message": map[string]any{"message": map[string]any{
+		"author": map[string]any{"role": "tool"}, "create_time": 1,
+		"metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": parts},
+	}}}})
 }

@@ -74,6 +74,23 @@ type Config struct {
 	ImageMaxConcurrency    int
 	ImageRetentionDays     int
 	ImageCleanupInterval   time.Duration
+	R2WorkerURL            string
+	R2WorkerToken          string
+	R2PublicBaseURLs       []string
+	R2RetentionHours       int
+	R2WorkerPool           []R2WorkerConfig
+}
+
+// R2WorkerConfig describes one per-account ingest Worker. Tokens are loaded
+// from the environment and must never be persisted in the application config
+// file or included in logs.
+type R2WorkerConfig struct {
+	ID         string   `json:"id,omitempty"`
+	Name       string   `json:"name,omitempty"`
+	URL        string   `json:"url"`
+	Token      string   `json:"token"`
+	PublicURLs []string `json:"public_urls,omitempty"`
+	Enabled    bool     `json:"enabled"`
 }
 
 type ProxyGroup struct {
@@ -123,17 +140,15 @@ func Load(root string) (Config, error) {
 	if chatMaxRetries > 3 {
 		chatMaxRetries = 3
 	}
-	imageAccountConcurrency := envInt("GO_IMAGE_ACCOUNT_CONCURRENCY", 1)
-	if imageAccountConcurrency < 1 {
-		imageAccountConcurrency = 1
-	}
+	// Preserve the legacy unlimited default. Deployments can opt in to a
+	// per-account cap with GO_IMAGE_ACCOUNT_CONCURRENCY.
+	imageAccountConcurrency := envIntAllowZero("GO_IMAGE_ACCOUNT_CONCURRENCY", 0)
 	if imageAccountConcurrency > 4 {
 		imageAccountConcurrency = 4
 	}
-	imageMaxConcurrency := envInt("GO_IMAGE_MAX_CONCURRENCY", 128)
-	if imageMaxConcurrency < 1 {
-		imageMaxConcurrency = 1
-	}
+	// Preserve the legacy default of 128; operators can lower this in the
+	// environment when the upstream/proxy needs backpressure.
+	imageMaxConcurrency := envIntAllowZero("GO_IMAGE_MAX_CONCURRENCY", 128)
 	if imageMaxConcurrency > 1024 {
 		imageMaxConcurrency = 1024
 	}
@@ -202,7 +217,7 @@ func Load(root string) (Config, error) {
 		RegisterCaptchaURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_CAPTCHA_URL")), "/"),
 		RegisterDriverURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_URL")), "/"),
 		RegisterDriverKey:      strings.TrimSpace(os.Getenv("GO_REGISTER_DRIVER_KEY")),
-		Version:                env("GO_VERSION", "1.2.1-go"),
+		Version:                env("GO_VERSION", "1.2.4-go"),
 		AllowAnonymous:         envBool("GO_ALLOW_ANONYMOUS", false),
 		RequestTimeout:         time.Duration(requestTimeoutSeconds) * time.Second,
 		ChatMaxRetries:         chatMaxRetries,
@@ -211,6 +226,11 @@ func Load(root string) (Config, error) {
 		ImageMaxConcurrency:    imageMaxConcurrency,
 		ImageRetentionDays:     imageRetentionDays,
 		ImageCleanupInterval:   time.Duration(imageCleanupIntervalSeconds) * time.Second,
+		R2WorkerURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("GO_R2_WORKER_URL")), "/"),
+		R2WorkerToken:          strings.TrimSpace(os.Getenv("GO_R2_WORKER_TOKEN")),
+		R2PublicBaseURLs:       splitList(os.Getenv("GO_R2_PUBLIC_BASE_URLS")),
+		R2RetentionHours:       envIntRange("GO_R2_RETENTION_HOURS", 12, 1, 168),
+		R2WorkerPool:           parseR2WorkerPool(os.Getenv("GO_R2_WORKER_POOL_JSON")),
 	}
 
 	rawConfig, err := readMap(cfg.ConfigPath)
@@ -247,6 +267,33 @@ func Load(root string) (Config, error) {
 	applyProxyConfig(&cfg, rawConfig)
 
 	return cfg, nil
+}
+
+func parseR2WorkerPool(value string) []R2WorkerConfig {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	var entries []R2WorkerConfig
+	if err := json.Unmarshal([]byte(value), &entries); err != nil {
+		return nil
+	}
+	result := make([]R2WorkerConfig, 0, len(entries))
+	for _, entry := range entries {
+		entry.URL = strings.TrimRight(strings.TrimSpace(entry.URL), "/")
+		entry.Token = strings.TrimSpace(entry.Token)
+		cleanURLs := make([]string, 0, len(entry.PublicURLs))
+		for _, publicURL := range entry.PublicURLs {
+			if publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/"); publicURL != "" {
+				cleanURLs = append(cleanURLs, publicURL)
+			}
+		}
+		entry.PublicURLs = cleanURLs
+		if entry.URL == "" {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 func applyProxyConfig(cfg *Config, values map[string]any) {
@@ -316,7 +363,9 @@ func parseProxyGroups(value any) []ProxyGroup {
 				RuntimeLatencyMS: int64(configInt(nodeMap["runtime_latency_ms"])),
 			}
 			if node.ImageConcurrencyLimit < 1 {
-				node.ImageConcurrencyLimit = 3
+				// The pre-proxy-group scheduler did not impose a per-node cap.
+				// Preserve that behavior unless an operator configures a limit.
+				node.ImageConcurrencyLimit = 20
 			}
 			group.Nodes = append(group.Nodes, node)
 		}
@@ -389,6 +438,17 @@ func envIntAllowZero(name string, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
 	if err != nil || value < 0 {
 		return fallback
+	}
+	return value
+}
+
+func envIntRange(name string, fallback, minValue, maxValue int) int {
+	value := envIntAllowZero(name, fallback)
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
 	}
 	return value
 }

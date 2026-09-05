@@ -6,14 +6,26 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   app:
     build:
       context: .
       dockerfile: Dockerfile.golang
     image: ${CHATGPT2API_GO_IMAGE:-gptgrok2api-go:local}
+    user: "0:0"
     container_name: gptgrok2api-go
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     ports:
       - "${CHATGPT2API_GO_PORT:-3000}:80"
     volumes:
@@ -26,9 +38,21 @@ services:
       GO_UPSTREAM_URL: ${GO_UPSTREAM_URL:-}
       GO_UPSTREAM_API_KEY: ${GO_UPSTREAM_API_KEY:-}
       GO_PUBLIC_BASE_URL: ${GO_PUBLIC_BASE_URL:-}
+      GO_R2_WORKER_URL: ${GO_R2_WORKER_URL:-}
+      GO_R2_WORKER_TOKEN: ${GO_R2_WORKER_TOKEN:-}
+      GO_R2_PUBLIC_BASE_URLS: ${GO_R2_PUBLIC_BASE_URLS:-}
+      GO_R2_RETENTION_HOURS: ${GO_R2_RETENTION_HOURS:-12}
+      GO_R2_WORKER_POOL_JSON: ${GO_R2_WORKER_POOL_JSON:-}
       GO_QUEUE_BACKEND: ${GO_QUEUE_BACKEND:-redis}
       GO_REDIS_ADDR: ${GO_REDIS_ADDR:-redis:6379}
+      # One request per account, with room for the full 1000-account pool.
+      GO_IMAGE_ACCOUNT_CONCURRENCY: ${GO_IMAGE_ACCOUNT_CONCURRENCY:-1}
+      GO_IMAGE_MAX_CONCURRENCY: ${GO_IMAGE_MAX_CONCURRENCY:-1000}
+      GO_IMAGE_SCHEDULER_KEY: ${IMAGE_SCHEDULER_INTERNAL_KEY:-}
       TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       default:
       upstream:
@@ -58,7 +82,7 @@ services:
       image-queue-redis:
         condition: service_healthy
       app:
-        condition: service_started
+        condition: service_healthy
     environment:
       IMAGE_GATEWAY_REDIS_ADDR: image-queue-redis:6379
       IMAGE_GATEWAY_BACKEND_URL: http://app/v1/images/generations
@@ -68,10 +92,12 @@ services:
       IMAGE_GATEWAY_SCHEDULER_KEY: ${IMAGE_SCHEDULER_INTERNAL_KEY:-}
       IMAGE_GATEWAY_AUTH_KEYS_FILE: /etc/image-gateway/auth_keys.json
       IMAGE_GATEWAY_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
-      # Defaults sized for a small host; raise workers for higher throughput.
-      IMAGE_GATEWAY_WORKERS: ${IMAGE_GATEWAY_WORKERS:-8}
-      IMAGE_GATEWAY_QUEUE_CAPACITY: ${IMAGE_GATEWAY_QUEUE_CAPACITY:-1000}
+      # Match a 1000-account pool; override downward on smaller hosts.
+      IMAGE_GATEWAY_WORKERS: ${IMAGE_GATEWAY_WORKERS:-1000}
+      IMAGE_GATEWAY_QUEUE_CAPACITY: ${IMAGE_GATEWAY_QUEUE_CAPACITY:-5000}
       IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS: ${IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS:-900}
+      # Return slow synchronous calls as pollable tasks before Cloudflare's ~120s timeout.
+      IMAGE_GATEWAY_SYNC_WAIT_SECS: ${IMAGE_GATEWAY_SYNC_WAIT_SECS:-90}
       IMAGE_GATEWAY_TASK_TTL_SECS: ${IMAGE_GATEWAY_TASK_TTL_SECS:-86400}
       IMAGE_GATEWAY_MAX_ATTEMPTS: ${IMAGE_GATEWAY_MAX_ATTEMPTS:-1}
       # 25 MiB accepts typical image requests while limiting memory pressure.

@@ -110,6 +110,12 @@ type Manager struct {
 	imageSelections uint64
 	imageWake       chan struct{}
 	onImageResult   func(ImageNodeRuntimeResult)
+	fallbackHealth  map[string]*fallbackState
+}
+
+type fallbackState struct {
+	failures      int
+	cooldownUntil time.Time
 }
 
 type GroupConfig struct {
@@ -138,23 +144,27 @@ type imageNode struct {
 	id, name, url                        string
 	limit, inFlight, failures, successes int
 	latencyMS                            int64
+	quality                              float64
+	probeAttempts                        uint64
 	cooldownUntil                        time.Time
 	evicted                              bool
 }
 
 type Lease struct {
-	manager   *Manager
-	node      *imageNode
-	URL       string
-	Source    string
-	GroupID   string
-	GroupName string
-	NodeID    string
-	NodeName  string
-	once      sync.Once
-	failed    atomic.Bool
-	slow      atomic.Bool
-	latencyMS atomic.Int64
+	manager     *Manager
+	node        *imageNode
+	URL         string
+	Source      string
+	GroupID     string
+	GroupName   string
+	NodeID      string
+	NodeName    string
+	fallbackKey string
+	once        sync.Once
+	failed      atomic.Bool
+	canceled    atomic.Bool
+	slow        atomic.Bool
+	latencyMS   atomic.Int64
 }
 
 type EgressInfo struct {
@@ -194,6 +204,21 @@ func MarkImageLeaseFailure(ctx context.Context) {
 	}
 }
 
+// MarkImageLeaseCanceled records a caller-side cancellation. It releases the
+// slot without changing the node's success or failure counters.
+func MarkImageLeaseCanceled(ctx context.Context) {
+	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
+	if lease != nil {
+		lease.MarkCanceled()
+	}
+}
+
+func (l *Lease) MarkCanceled() {
+	if l != nil {
+		l.canceled.Store(true)
+	}
+}
+
 // ObserveImageLeaseStage records only proxy-sensitive stage latency. The
 // upstream image-generation duration must not be included in this score.
 func ObserveImageLeaseStage(ctx context.Context, elapsed, slowAfter time.Duration) {
@@ -223,7 +248,7 @@ func NewManager(single string, pool []string) *Manager {
 			clean = append(clean, value)
 		}
 	}
-	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}, imageWake: make(chan struct{})}
+	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}, imageWake: make(chan struct{}), fallbackHealth: map[string]*fallbackState{}}
 }
 
 func (m *Manager) SetDefault(single string, pool []string) {
@@ -240,6 +265,9 @@ func (m *Manager) SetDefault(single string, pool []string) {
 	m.url = normalizeURL(single)
 	m.pool = clean
 	m.cursor = 0
+	if m.fallbackHealth == nil {
+		m.fallbackHealth = map[string]*fallbackState{}
+	}
 	m.mu.Unlock()
 }
 
@@ -281,7 +309,7 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 			if latencyMS < 0 {
 				latencyMS = 0
 			}
-			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes, latencyMS: latencyMS})
+			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes, latencyMS: latencyMS, quality: initialImageNodeQuality(successes, failures)})
 		}
 		next[id] = item
 	}
@@ -302,7 +330,17 @@ func probeAllowsRuntimeValidation(status int, lastError string) bool {
 	if status == http.StatusForbidden || (status >= 200 && status < 400) {
 		return true
 	}
-	return status == 0 && strings.TrimSpace(lastError) == ""
+	if status != 0 {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(lastError))
+	if message == "" {
+		return true
+	}
+	// A canceled batch probe does not say anything about the proxy itself.
+	// Keep those nodes eligible so a later refresh can test them again.
+	return strings.Contains(message, "context canceled") ||
+		strings.Contains(message, "request canceled")
 }
 
 // AcquireImage chooses one proxy for the complete multi-stage image request.
@@ -340,7 +378,7 @@ func (m *Manager) AcquireImage(fields map[string]any) *Lease {
 	if proxyURL == "" && configured {
 		return &Lease{Source: "unavailable"}
 	}
-	return &Lease{URL: proxyURL, Source: "default"}
+	return &Lease{manager: m, URL: proxyURL, Source: "default", fallbackKey: proxyURL}
 }
 
 // AcquireImageContext waits for configured proxy-group capacity instead of
@@ -388,7 +426,7 @@ func (m *Manager) AcquireImageContext(ctx context.Context, fields map[string]any
 	if proxyURL == "" && configured {
 		return &Lease{Source: "unavailable"}, nil
 	}
-	return &Lease{URL: proxyURL, Source: "default"}, nil
+	return &Lease{manager: m, URL: proxyURL, Source: "default", fallbackKey: proxyURL}, nil
 }
 
 func (m *Manager) acquireGroupContext(ctx context.Context, groupID string) (*Lease, bool, error) {
@@ -486,6 +524,7 @@ func (m *Manager) pickStableNodeLocked(group *imageGroup, now time.Time, exclude
 }
 
 func (m *Manager) pickProbeNodeLocked(group *imageGroup, now time.Time, excludedURL string) int {
+	best := -1
 	for offset := 0; offset < len(group.nodes); offset++ {
 		index := (m.imageCursor + offset) % len(group.nodes)
 		node := group.nodes[index]
@@ -493,9 +532,15 @@ func (m *Manager) pickProbeNodeLocked(group *imageGroup, now time.Time, excluded
 			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
 			continue
 		}
-		return index
+		if best < 0 || node.probeAttempts < group.nodes[best].probeAttempts ||
+			(node.probeAttempts == group.nodes[best].probeAttempts && imageNodeBetter(node, group.nodes[best])) {
+			best = index
+		}
 	}
-	return -1
+	if best >= 0 {
+		group.nodes[best].probeAttempts++
+	}
+	return best
 }
 
 func imageNodeBetter(candidate, current *imageNode) bool {
@@ -504,7 +549,34 @@ func imageNodeBetter(candidate, current *imageNode) bool {
 	if left != right {
 		return left < right
 	}
-	return effectiveImageNodeLatency(candidate) < effectiveImageNodeLatency(current)
+	leftScore := float64(effectiveImageNodeLatency(candidate)) / imageNodeQuality(candidate)
+	rightScore := float64(effectiveImageNodeLatency(current)) / imageNodeQuality(current)
+	if leftScore != rightScore {
+		return leftScore < rightScore
+	}
+	return candidate.successes > current.successes
+}
+
+func initialImageNodeQuality(successes, failures int) float64 {
+	if successes < 0 {
+		successes = 0
+	}
+	if failures < 0 {
+		failures = 0
+	}
+	// Bayesian smoothing avoids treating a brand-new node as either perfect
+	// or dead before it has carried a real image request.
+	return float64(successes+1) / float64(successes+failures+2)
+}
+
+func imageNodeQuality(node *imageNode) float64 {
+	if node == nil || node.quality <= 0 {
+		return 0.5
+	}
+	if node.quality > 1 {
+		return 1
+	}
+	return node.quality
 }
 
 func effectiveImageNodeLatency(node *imageNode) int64 {
@@ -525,15 +597,24 @@ func (m *Manager) resolveImageFallback() (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	configured := m.url != "" || len(m.pool) > 0
+	if m.fallbackHealth == nil {
+		m.fallbackHealth = map[string]*fallbackState{}
+	}
 	for offset := 0; offset < len(m.pool); offset++ {
 		index := (m.cursor + offset) % len(m.pool)
-		if imageProxyCompatible(m.pool[index]) {
+		candidate := m.pool[index]
+		if imageProxyCompatible(candidate) {
+			if state := m.fallbackHealth[candidate]; state != nil && time.Now().Before(state.cooldownUntil) {
+				continue
+			}
 			m.cursor = (index + 1) % len(m.pool)
-			return m.pool[index], true
+			return candidate, true
 		}
 	}
 	if imageProxyCompatible(m.url) {
-		return m.url, true
+		if state := m.fallbackHealth[m.url]; state == nil || !time.Now().Before(state.cooldownUntil) {
+			return m.url, true
+		}
 	}
 	if m.upstreamRouter != nil {
 		if upstream := m.upstreamRouter.Resolve(); upstream != "" {
@@ -619,7 +700,33 @@ func (l *Lease) Release(runtimeFailure bool) {
 		return
 	}
 	l.once.Do(func() {
-		if l.manager == nil || l.node == nil {
+		if l.manager == nil {
+			return
+		}
+		if l.node == nil && l.fallbackKey != "" {
+			l.manager.mu.Lock()
+			if l.manager.fallbackHealth == nil {
+				l.manager.fallbackHealth = map[string]*fallbackState{}
+			}
+			state := l.manager.fallbackHealth[l.fallbackKey]
+			if state == nil {
+				state = &fallbackState{}
+				l.manager.fallbackHealth[l.fallbackKey] = state
+			}
+			if l.canceled.Load() {
+				l.manager.signalImageLocked()
+				l.manager.mu.Unlock()
+				return
+			}
+			if runtimeFailure || l.failed.Load() {
+				state.failures++
+				state.cooldownUntil = time.Now().Add(time.Duration(1<<min(state.failures-1, 5)) * time.Minute)
+			} else {
+				state.failures = 0
+				state.cooldownUntil = time.Time{}
+			}
+			l.manager.signalImageLocked()
+			l.manager.mu.Unlock()
 			return
 		}
 		var event *ImageNodeRuntimeResult
@@ -627,9 +734,15 @@ func (l *Lease) Release(runtimeFailure bool) {
 		if l.node.inFlight > 0 {
 			l.node.inFlight--
 		}
+		if l.canceled.Load() {
+			l.manager.signalImageLocked()
+			l.manager.mu.Unlock()
+			return
+		}
 		runtimeFailure = runtimeFailure || l.failed.Load()
 		observedLatencyMS := l.latencyMS.Load()
 		if runtimeFailure && !l.node.evicted {
+			l.node.quality = imageNodeQuality(l.node) * 0.8
 			l.node.failures++
 			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
 			l.node.cooldownUntil = time.Now().Add(cooldown)
@@ -656,6 +769,7 @@ func (l *Lease) Release(runtimeFailure bool) {
 			hadFailures := l.node.failures > 0
 			l.node.failures = 0
 			l.node.successes++
+			l.node.quality = imageNodeQuality(l.node)*0.8 + 0.2
 			if observedLatencyMS > 0 {
 				if l.node.latencyMS <= 0 {
 					l.node.latencyMS = observedLatencyMS

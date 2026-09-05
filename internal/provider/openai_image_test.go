@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -100,6 +101,35 @@ func TestOpenAIImageUploadWithoutStableProxyDoesNotRepeatBadRoute(t *testing.T) 
 	)
 	if err == nil || attempts != 1 {
 		t.Fatalf("expected one attempt without a distinct stable route, attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestOpenAIImageUploadRetriesProxyCapacityErrorWithBackoff(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts < 3 {
+			return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("Proxy responded with non 200 code: 503 Too many open connections")), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})}
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, nil, 5*time.Second)
+	started := time.Now()
+	err := imageClient.uploadInputBlob(
+		proxyruntime.WithURL(context.Background(), "http://proxy.invalid:8080"),
+		accounts.Account{},
+		"https://storage.invalid/upload",
+		[]byte("image"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected bounded capacity retries, attempts=%d", attempts)
+	}
+	if time.Since(started) < 500*time.Millisecond {
+		t.Fatalf("capacity retries did not apply backoff")
 	}
 }
 
@@ -304,6 +334,59 @@ func TestOpenAIImageProxyFailureExcludesProviderServerErrors(t *testing.T) {
 	if !openAIImageProxyFailure(errors.New("read: connection reset by peer")) {
 		t.Fatal("transport reset was not attributed to the proxy")
 	}
+	if openAIImageProxyFailure(&protocol.UpstreamError{Status: http.StatusForbidden, Message: "clearance required"}) {
+		t.Fatal("provider HTTP 403 must not be attributed to the proxy")
+	}
+	if !openAIImageProxyFailure(errors.New("HTTP proxy CONNECT returned HTTP 404")) {
+		t.Fatal("proxy CONNECT HTTP 404 must be attributed to the proxy")
+	}
+}
+
+func TestCollectOpenAIGeneratedImageRefsKeepsDirectImageURL(t *testing.T) {
+	value := map[string]any{
+		"mapping": map[string]any{
+			"assistant": map[string]any{
+				"message": map[string]any{
+					"author":   map[string]any{"role": "assistant"},
+					"content":  map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://generated"},
+					"metadata": map[string]any{"download_url": "https://cdn.example.test/generated.png?token=redacted"},
+				},
+			},
+		},
+	}
+	var conversationID string
+	refs := []string{}
+	collectOpenAIGeneratedImageRefs(value, &conversationID, &refs)
+	if len(refs) != 2 || refs[1] != "https://cdn.example.test/generated.png?token=redacted" {
+		t.Fatalf("direct image URL was not preserved: %#v", refs)
+	}
+	if !isDirectImageURL(refs[1]) || guessImageMIME(refs[1]) != "image/png" {
+		t.Fatalf("direct image URL was not recognized: %q", refs[1])
+	}
+}
+
+func TestCollectOpenAIGeneratedImageRefsSupportsNestedAndEmbeddedURLs(t *testing.T) {
+	value := map[string]any{"mapping": map[string]any{
+		"assistant": map[string]any{"message": map[string]any{
+			"author":  map[string]any{"role": "assistant"},
+			"content": map[string]any{"content_type": "image_asset_pointer", "image_url": map[string]any{"url": "https://cdn.example.test/generated?sig=1"}},
+		}},
+		"tool": map[string]any{"message": map[string]any{
+			"author":  map[string]any{"role": "tool"},
+			"content": "ready https://cdn.example.test/tool-image?sig=2",
+		}},
+	}}
+	var conversationID string
+	refs := []string{}
+	collectOpenAIGeneratedImageRefs(value, &conversationID, &refs)
+	hasGenerated, hasTool := false, false
+	for _, ref := range refs {
+		hasGenerated = hasGenerated || ref == "https://cdn.example.test/generated?sig=1"
+		hasTool = hasTool || ref == "https://cdn.example.test/tool-image?sig=2"
+	}
+	if !hasGenerated || !hasTool {
+		t.Fatalf("nested or embedded direct URLs were not preserved: %#v", refs)
+	}
 }
 
 func TestOpenAIImageGenerationFlow(t *testing.T) {
@@ -328,6 +411,8 @@ func TestOpenAIImageGenerationFlow(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-1":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/blob":
@@ -372,6 +457,8 @@ func TestOpenAIImageGenerationFlowConversationIDVariant(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversationId\":\"conversation-2\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-2":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/blob":
@@ -449,6 +536,82 @@ func TestOpenAIImageGenerationPollsAndDownloadsSedimentAttachment(t *testing.T) 
 	}
 }
 
+func TestOpenAIImageGenerationDownloadsAssistantOutputInsteadOfEchoedReference(t *testing.T) {
+	referenceID := "file_00000000111111111111111111111111"
+	generatedID := "file_00000000222222222222222222222222"
+	referenceBytes := onePixelPNG(t)
+	generatedBytes := []byte("generated-image-output")
+	var referenceDownloads atomic.Int32
+	var generatedDownloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"file_id": referenceID, "upload_url": serverURL(r) + "/reference-upload"})
+		case r.Method == http.MethodPut && r.URL.Path == "/reference-upload":
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/files/"+referenceID+"/uploaded":
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case r.URL.Path == "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case r.URL.Path == "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case r.URL.Path == "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-reference\",\"message\":{\"author\":{\"role\":\"user\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://%s\"}]}}}\n\n", referenceID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case r.URL.Path == "/backend-api/conversation/conversation-reference":
+			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{
+				"user": map[string]any{"message": map[string]any{
+					"author": map[string]any{"role": "user"}, "create_time": 1,
+					"content": map[string]any{"parts": []any{map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + referenceID}}},
+				}},
+				"assistant": map[string]any{"message": map[string]any{
+					"author": map[string]any{"role": "assistant"}, "create_time": 2,
+					"content": map[string]any{"parts": []any{map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + generatedID}}},
+				}},
+			}})
+		case r.URL.Path == "/backend-api/files/"+referenceID+"/download":
+			referenceDownloads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/reference-blob"})
+		case r.URL.Path == "/backend-api/files/"+generatedID+"/download":
+			generatedDownloads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/generated-blob"})
+		case r.URL.Path == "/reference-blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(referenceBytes)
+		case r.URL.Path == "/generated-blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(generatedBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	account := accounts.Account{Token: "jwt.header.payload", Fields: map[string]any{"source_type": "chatgpt_web"}}
+	results, err := client.Generate(context.Background(), account, "按参考图生成", "gpt-image-2", "1024x1024", "auto", []OpenAIImageInput{{Name: "reference.png", MIME: "image/png", Data: referenceBytes}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one generated image, got %#v", results)
+	}
+	raw, err := base64.StdEncoding.DecodeString(results[0].Base64)
+	if err != nil || !bytes.Equal(raw, generatedBytes) {
+		t.Fatalf("returned bytes are not the generated output: raw=%q err=%v", raw, err)
+	}
+	if referenceDownloads.Load() != 0 || generatedDownloads.Load() != 1 {
+		t.Fatalf("unexpected downloads: reference=%d generated=%d", referenceDownloads.Load(), generatedDownloads.Load())
+	}
+}
+
 func TestOpenAIImageGenerationKeepsDownloadableResultWhenAnotherFileHasNoURL(t *testing.T) {
 	goodFileID := "file_000000001234567890abcdef12345678"
 	staleFileID := "file_000000009999999999abcdef12345678"
@@ -469,6 +632,8 @@ func TestOpenAIImageGenerationKeepsDownloadableResultWhenAnotherFileHasNoURL(t *
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-mixed\",\"message\":{\"content\":{\"parts\":[\"file-service://" + goodFileID + "\",\"file-service://" + staleFileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-mixed":
+			writeGeneratedImageConversation(w, goodFileID, staleFileID)
 		case "/backend-api/files/" + goodFileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/backend-api/files/" + staleFileID + "/download":
@@ -511,6 +676,8 @@ func TestOpenAIImageGenerationFailsWhenEveryFileHasNoURL(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-stale\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-stale":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
 		default:
@@ -529,10 +696,20 @@ func TestOpenAIImageGenerationFailsWhenEveryFileHasNoURL(t *testing.T) {
 
 func TestNormalizeOpenAIImageSize(t *testing.T) {
 	tests := map[string]string{
-		"1024x1365": "1024x1360",
-		"1365x1024": "1360x1024",
-		"1920x1080": "1920x1088",
-		"1024x1536": "1024x1536",
+		"1:1":         "1024x1024",
+		"2:3":         "1024x1536",
+		"3:2":         "1536x1024",
+		"3:4":         "1024x1360",
+		"4:3":         "1360x1024",
+		"9:16":        "1088x1920",
+		"16:9":        "1920x1088",
+		"1024×1536":   "1024x1536",
+		"1024 * 1024": "1024x1024",
+		"1024x1365":   "1024x1360",
+		"1365x1024":   "1360x1024",
+		"1920x1080":   "1920x1088",
+		"1024x1536":   "1024x1536",
+		"123x456":     "123x456",
 	}
 	for input, expected := range tests {
 		if actual := NormalizeOpenAIImageSize(input); actual != expected {
@@ -578,6 +755,30 @@ func TestOpenAIImageResolvePersistsB64JSONResponse(t *testing.T) {
 	}
 }
 
+type testImageStorage struct{ URL string }
+
+func (s testImageStorage) Put(context.Context, string, string, []byte) (string, error) {
+	return s.URL, nil
+}
+func (s testImageStorage) PutSourceURL(context.Context, string, string, string) (string, error) {
+	return s.URL, nil
+}
+
+func TestOpenAIImageResolveUsesConfiguredStorageForURL(t *testing.T) {
+	imageDir := t.TempDir()
+	client := NewOpenAIImage("https://example.com", nil, nil, time.Second)
+	client.SetImageStorage(testImageStorage{URL: "https://img.example/r2/one.png"})
+	raw := onePixelPNG(t)
+	response, value, err := client.Resolve(context.Background(), accounts.Account{}, ImageResult{Base64: base64.StdEncoding.EncodeToString(raw), MIME: "image/png"}, "url", imageDir, "https://local.example")
+	if err != nil || response["url"] != "https://img.example/r2/one.png" || value != response["url"] {
+		t.Fatalf("unexpected R2 response: %#v %q %v", response, value, err)
+	}
+	entries, _ := os.ReadDir(imageDir)
+	if len(entries) != 0 {
+		t.Fatalf("R2 URL path should not persist a local file: %d entries", len(entries))
+	}
+}
+
 func TestCollectOpenAIImageRefsAcceptsCurrentFileIDShape(t *testing.T) {
 	conversationID := ""
 	fileIDs := []string{}
@@ -608,6 +809,47 @@ func TestCollectOpenAIImageRefsAcceptsSedimentPointer(t *testing.T) {
 	if conversationID != "conversation-sediment" || len(imageRefs) != 1 || imageRefs[0] != "sediment://01JSEDIMENT1234567890" {
 		t.Fatalf("unexpected sediment parsing: conversation=%q refs=%#v", conversationID, imageRefs)
 	}
+}
+
+func TestCollectOpenAIGeneratedImageRefsUsesOnlyOrderedOutputRecords(t *testing.T) {
+	conversationID := ""
+	refs := []string{}
+	collectOpenAIGeneratedImageRefs(map[string]any{
+		"conversation_id": "conversation-generated",
+		"mapping": map[string]any{
+			"user-message": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "user"}, "create_time": 1,
+				"content": map[string]any{"asset_pointer": "sediment://file_reference"},
+			}},
+			"assistant-text": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "assistant"}, "create_time": 2,
+				"content": map[string]any{"parts": []any{"unrelated file_00000000999999999999999999999999"}},
+			}},
+			"later-assistant-image": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "assistant"}, "create_time": 4,
+				"content": map[string]any{"asset_pointer": "sediment://assistant_generated"},
+			}},
+			"earlier-tool-image": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "tool"}, "create_time": 3,
+				"metadata": map[string]any{"async_task_type": "image_gen"},
+				"content":  map[string]any{"asset_pointer": "sediment://tool_generated"},
+			}},
+		},
+	}, &conversationID, &refs)
+	if conversationID != "conversation-generated" || len(refs) != 2 || refs[0] != "sediment://tool_generated" || refs[1] != "sediment://assistant_generated" {
+		t.Fatalf("unexpected generated refs: conversation=%q refs=%#v", conversationID, refs)
+	}
+}
+
+func writeGeneratedImageConversation(w http.ResponseWriter, fileIDs ...string) {
+	parts := make([]any, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		parts = append(parts, map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fileID})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"tool-message": map[string]any{"message": map[string]any{
+		"author": map[string]any{"role": "tool"}, "create_time": 1,
+		"metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": parts},
+	}}}})
 }
 
 func onePixelPNG(t *testing.T) []byte {

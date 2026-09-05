@@ -2,7 +2,7 @@
 
 GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关，使用 Go 运行时接入 OpenAI/ChatGPT JWT 账号池、Grok SSO/OAuth 账号池和代理出口，并提供 Web 控制台、账号调度、图片存储、实时监控与日志管理。
 
-当前版本：`1.2.1-go`
+当前版本：`1.2.4-go`
 
 ## 能力
 
@@ -103,6 +103,30 @@ curl http://127.0.0.1:8000/v1/images/generations \
   -d '{"model":"gpt-image-2","prompt":"画一只猫","size":"1024x1024"}'
 ~~~
 
+#### 异步任务和状态码
+
+图片生成通常需要数分钟。`POST /v1/images/generations` 在同步等待窗口内拿到图片时返回 `200`；如果请求经过 Cloudflare 或其他边缘网关，网关会在约 90 秒后返回 `202`，任务不会停止。响应中的 `id`、`status_url` 和 `Location` 用于轮询：
+
+~~~bash
+curl http://127.0.0.1:8000/v1/image-tasks/<task-id> \
+  -H "Authorization: Bearer $API_KEY"
+~~~
+
+轮询结果的 `status` 为 `queued`/`running` 时继续等待；`success` 时读取 `result.data`；`failed` 时读取 `status_code` 和 `error`。常见状态码含义如下：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `202` | 任务已接受并继续后台执行，不代表成功或失败 |
+| `400` | 请求参数错误，例如模型不支持或图片尺寸无效 |
+| `502` | 上游没有返回有效图片，或网关收到上游 `202`/空结果 |
+| `503` | 队列、Redis 或代理出口暂时不可用 |
+
+直连服务器的 `:3000` 端口不经过 Cloudflare，默认最多等待 900 秒；公网域名建议始终实现 `202` 轮询。终态任务默认在 Redis 保留 24 小时，避免图片已生成但轮询稍晚导致任务消失。
+
+#### 图片尺寸兼容
+
+OpenAI 图片接口接受标准尺寸以及常见比例写法。`1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`9:16`、`16:9` 会在网关中转换为上游要求的 16 像素对齐尺寸；`1024x1365`、`1920x1080` 等旧前端值也会自动校正。无法识别的尺寸会明确返回 `400 invalid image size`。
+
 图片编辑必须使用 `multipart/form-data`：
 
 ~~~bash
@@ -189,7 +213,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_PROXY_URL` | 空 | 默认代理 |
 | `GO_PROXY_POOL` | 空 | 逗号分隔代理池 |
 | `GO_OPENAI_BASE_URL` | `https://chatgpt.com` | ChatGPT 上游 |
-| `GO_VERSION` | `1.2.1-go` | 版本标识 |
+| `GO_VERSION` | `1.2.4-go` | 版本标识 |
 | `GO_IMAGE_RETENTION_DAYS` | `1` | 本地图片和元数据保留天数 |
 | `GO_IMAGE_CLEANUP_INTERVAL_SECONDS` | `3600` | 自动清理检查间隔，最少 60 秒 |
 
@@ -213,10 +237,14 @@ CHATGPT2API_AUTH_KEY=replace-with-a-long-random-key
 CHATGPT2API_ADMIN_KEY=replace-with-a-different-admin-key
 CHATGPT2API_GO_PORT=8000
 GO_PUBLIC_BASE_URL=https://gpt.qkmss.com
-GO_VERSION=1.2.1-go
+GO_VERSION=1.2.4-go
 ~~~
 
 更新前备份 `/opt/gpt2api-go/data`，更新后检查 `/health`、`/v1/models` 和 `/v1/files/image?id=...`。
+
+### 图片网关高并发参数
+
+`docker-compose.go.yml` 已包含 Redis 图片队列和独立网关。1000 个账号的示例参数为 `IMAGE_GATEWAY_WORKERS=1000`、`IMAGE_GATEWAY_QUEUE_CAPACITY=5000`、`IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS=900`、`IMAGE_GATEWAY_SYNC_WAIT_SECS=90`。实际并发必须小于代理服务商的连接容量；出现 `503 Too many open connections` 时应降低 `GO_IMAGE_MAX_CONCURRENCY` 或增加代理出口。上传阶段会进行有限次数的代理切换重试，但不会突破代理方的连接上限。
 
 ## 本地开发
 
@@ -226,6 +254,9 @@ Go 版不需要 Python 或 Uvicorn：
 go run ./cmd/gptgrok2api
 go test ./internal/...
 CGO_ENABLED=0 go build -trimpath -o gptgrok2api ./cmd/gptgrok2api
+cd go-image-gateway && go test ./...
+cd ..
+docker compose -f docker-compose.go.yml config
 ~~~
 
 前端源码位于 `web-vue/`，Docker 构建时会自动生成 `web_dist/`。
@@ -242,6 +273,10 @@ logs/
 ~~~
 
 `data/` 可能包含账号 Token、Cookie、OAuth 凭据、图片和管理密钥。Go 版默认把生成结果及其元数据保留 1 天，后台每小时自动清理过期文件；可通过 `GO_IMAGE_RETENTION_DAYS` 调整。生产环境请使用随机密钥，不要上传运行时数据，只通过 Nginx/HTTPS 暴露 API，并定期备份 `data/`。
+
+## 开源贡献
+
+提交问题时请附上版本号、请求路径、任务 ID、轮询结果中的 `status_code` 和脱敏后的错误信息；不要提交 API Key、Cookie、JWT、代理凭据、账号文件或生成图片。功能修改应至少通过 `go test ./...`，涉及网关时在 `go-image-gateway/` 目录运行 `go test ./...`。
 
 ## 许可证
 

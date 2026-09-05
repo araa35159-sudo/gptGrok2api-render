@@ -116,7 +116,9 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isOpenAIImageModel(request.Model) {
-		data, err := s.generateOpenAIImageData(r, r.Context(), request.Prompt, request.Model, request.Size, request.Quality, nil, request.ResponseFormat, requestPublicBase(r), request.N)
+		workCtx, cancelWork := imageWorkContext(r, s.cfg.RequestTimeout)
+		defer cancelWork()
+		data, err := s.generateOpenAIImageData(r, workCtx, request.Prompt, request.Model, request.Size, request.Quality, nil, request.ResponseFormat, requestPublicBase(r), request.N)
 		if err != nil {
 			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
 			return
@@ -127,7 +129,9 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
 	accountStarted := time.Now()
-	lease, err := s.accountPool.Reserve(r.Context(), mediaPools(request.Model), nil)
+	workCtx, cancelWork := imageWorkContext(r, s.cfg.RequestTimeout)
+	defer cancelWork()
+	lease, err := s.accountPool.Reserve(workCtx, mediaPools(request.Model), nil)
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error")
 		return
@@ -138,10 +142,10 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	generationStarted := time.Now()
 	var images []provider.ImageResult
 	if request.Model == "grok-imagine-image-lite" {
-		images, err = s.mediaProvider.GenerateLite(r.Context(), lease.Account, request.Prompt, "fast", request.N)
+		images, err = s.mediaProvider.GenerateLite(workCtx, lease.Account, request.Prompt, "fast", request.N)
 	} else {
 		aspect, _ := protocol.AspectRatio(request.Size)
-		images, err = s.mediaProvider.GenerateImagine(r.Context(), lease.Account, request.Prompt, aspect, request.N, true, request.Model == "grok-imagine-image-pro", s.cfg.ImagineWSURL)
+		images, err = s.mediaProvider.GenerateImagine(workCtx, lease.Account, request.Prompt, aspect, request.N, true, request.Model == "grok-imagine-image-pro", s.cfg.ImagineWSURL)
 	}
 	if err != nil {
 		s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
@@ -155,7 +159,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	data := make([]map[string]string, 0, len(images))
 	for _, image := range images {
 		resolveStarted := time.Now()
-		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, request.ResponseFormat, s.cfg.ImageDataDir, requestPublicBase(r))
+		value, resolveErr := s.mediaProvider.ResolveImage(workCtx, lease.Account, image, request.ResponseFormat, s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
 			s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
@@ -163,7 +167,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		}
 		s.stageRequestMonitor(r, "image_resolving", 85, map[string]any{"resolve_ms": time.Since(resolveStarted).Milliseconds()})
 		s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"download_ms": time.Since(resolveStarted).Milliseconds()})
-		s.recordGeneratedMedia(r.Context(), value)
+		s.recordGeneratedMedia(workCtx, value)
 		data = append(data, value)
 	}
 	s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
@@ -176,6 +180,7 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		count = 1
 	}
 	results := make([][]map[string]string, count)
+	requestCtx := ctx
 	ctx, timeoutCancel := context.WithTimeout(ctx, imageRequestTotalTimeout(s.cfg.RequestTimeout))
 	defer timeoutCancel()
 	ctx, cancel := context.WithCancel(ctx)
@@ -183,7 +188,7 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 	ctx = s.monitorOpenAIImageContext(r, ctx)
 	var (
 		wg    sync.WaitGroup
-		errCh = make(chan error, 1)
+		errCh = make(chan error, count)
 	)
 	sendErr := func(err error) {
 		if err == nil {
@@ -221,6 +226,10 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 
 				generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
 				if generateErr != nil {
+					if isSiblingImageCancellation(generateErr, requestCtx, ctx) {
+						s.accountPool.Release(lease)
+						return
+					}
 					s.accountPool.Release(lease)
 					s.accountPool.Feedback(lease.Account, upstreamStatus(generateErr), generateErr)
 					excluded[lease.Account.Token] = true
@@ -248,6 +257,10 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 					break
 				}
 				if resolveErr != nil {
+					if isSiblingImageCancellation(resolveErr, requestCtx, ctx) {
+						s.accountPool.Release(lease)
+						return
+					}
 					s.accountPool.Release(lease)
 					s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
 					excluded[lease.Account.Token] = true
@@ -267,10 +280,12 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		}()
 	}
 	wg.Wait()
-	select {
-	case err := <-errCh:
+	errs := make([]error, 0, len(errCh))
+	for len(errCh) > 0 {
+		errs = append(errs, <-errCh)
+	}
+	if err := chooseImageBatchError(errs, requestCtx, ctx); err != nil {
 		return nil, err
-	default:
 	}
 	data := make([]map[string]string, 0)
 	for _, items := range results {
@@ -283,6 +298,41 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		data = data[:count]
 	}
 	return data, nil
+}
+
+// imageWorkContext deliberately outlives the inbound HTTP request. Image
+// generation commonly takes longer than a caller's timeout; canceling the
+// upstream work as soon as the caller disconnects leaves orphaned queue work
+// and turns a recoverable 499 into a failed generation. The server timeout
+// still bounds resource use.
+func imageWorkContext(r *http.Request, requestTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if r != nil && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Image-Gateway-Task")), "1") {
+		return context.WithTimeout(r.Context(), imageRequestTotalTimeout(requestTimeout))
+	}
+	parent := context.Background()
+	if r != nil {
+		parent = context.WithoutCancel(r.Context())
+	}
+	return context.WithTimeout(parent, imageRequestTotalTimeout(requestTimeout))
+}
+
+// chooseImageBatchError ignores context.Canceled caused by a sibling worker
+// after the first real error has already cancelled the shared operation.
+func chooseImageBatchError(errs []error, requestCtx, operationCtx context.Context) error {
+	for _, err := range errs {
+		if isSiblingImageCancellation(err, requestCtx, operationCtx) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isSiblingImageCancellation(err error, requestCtx, operationCtx context.Context) bool {
+	return err != nil && errors.Is(err, context.Canceled) && operationCtx != nil &&
+		errors.Is(operationCtx.Err(), context.Canceled) && (requestCtx == nil || requestCtx.Err() == nil)
 }
 
 func imageRequestTotalTimeout(requestTimeout time.Duration) time.Duration {
@@ -768,7 +818,9 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 			size = "1024x1024"
 		}
 		format := imageEditResponseFormat(request.ResponseFormat)
-		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
+		workCtx, cancelWork := imageWorkContext(r, s.cfg.RequestTimeout)
+		defer cancelWork()
+		data, err := s.generateOpenAIImageData(r, workCtx, prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
 		if err != nil {
 			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
 			return
@@ -776,7 +828,9 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 		return
 	}
-	lease, err := s.accountPool.Reserve(r.Context(), []string{"super", "heavy"}, nil)
+	workCtx, cancelWork := imageWorkContext(r, s.cfg.RequestTimeout)
+	defer cancelWork()
+	lease, err := s.accountPool.Reserve(workCtx, []string{"super", "heavy"}, nil)
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error")
 		return
@@ -784,7 +838,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	defer s.accountPool.Release(lease)
 	refs := make([]string, 0, len(inputs))
 	for _, input := range inputs {
-		fileID, fileURI, uploadErr := s.mediaProvider.Upload(r.Context(), lease.Account, input.Name, input.MIME, base64.StdEncoding.EncodeToString(input.Data))
+		fileID, fileURI, uploadErr := s.mediaProvider.Upload(workCtx, lease.Account, input.Name, input.MIME, base64.StdEncoding.EncodeToString(input.Data))
 		if uploadErr != nil {
 			s.accountPool.Feedback(lease.Account, upstreamStatus(uploadErr), uploadErr)
 			writeError(w, upstreamStatus(uploadErr), uploadErr.Error(), "upstream_error")
@@ -797,7 +851,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		}
 		refs = append(refs, ref)
 	}
-	post, err := s.mediaProvider.CreatePost(r.Context(), lease.Account, protocol.ImagePostMediaType, "", prompt)
+	post, err := s.mediaProvider.CreatePost(workCtx, lease.Account, protocol.ImagePostMediaType, "", prompt)
 	if err != nil {
 		s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 		writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
@@ -809,7 +863,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "image edit create-post returned no post id", "upstream_error")
 		return
 	}
-	response, err := s.mediaProvider.StreamChat(r.Context(), lease.Account, protocol.BuildImageEditPayload(prompt, refs, parentID))
+	response, err := s.mediaProvider.StreamChat(workCtx, lease.Account, protocol.BuildImageEditPayload(prompt, refs, parentID))
 	if err != nil {
 		s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 		writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
@@ -824,12 +878,12 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	data := make([]map[string]string, 0, minInt(n, len(images)))
 	format := imageEditResponseFormat(request.ResponseFormat)
 	for _, image := range images[:minInt(n, len(images))] {
-		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, format, s.cfg.ImageDataDir, requestPublicBase(r))
+		value, resolveErr := s.mediaProvider.ResolveImage(workCtx, lease.Account, image, format, s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
 			return
 		}
-		s.recordGeneratedMedia(r.Context(), value)
+		s.recordGeneratedMedia(workCtx, value)
 		data = append(data, value)
 	}
 	s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
@@ -1119,6 +1173,12 @@ func cookieUserID(account accounts.Account) string {
 }
 
 func upstreamStatus(err error) int {
+	// A caller disconnect is a client-side cancellation (nginx records this as
+	// 499), not an upstream gateway failure. Keep it out of account/proxy
+	// failure feedback and dashboard 5xx totals.
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}

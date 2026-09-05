@@ -26,9 +26,12 @@ type Media struct {
 	AssetsBaseURL  string
 	RequestTimeout time.Duration
 	Proxy          *proxyruntime.Manager
+	Storage        ImageStorage
 }
 
 func (m *Media) SetProxyManager(manager *proxyruntime.Manager) { m.Proxy = manager }
+
+func (m *Media) SetImageStorage(storage ImageStorage) { m.Storage = storage }
 
 func NewMedia(client *http.Client, imageChatURL, mediaPostURL, assetUploadURL, assetsBaseURL string, timeout time.Duration) *Media {
 	if client == nil {
@@ -96,9 +99,25 @@ func (m *Media) Fetch(ctx context.Context, account accounts.Account, filePath st
 	}
 	mime := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
 	if mime == "" {
-		mime = mimeFromPath(urlValue)
+		mime = http.DetectContentType(raw)
+	}
+	if !isImagePayload(raw, mime) {
+		return nil, "", fmt.Errorf("asset download returned non-image content (content_type=%s)", mime)
 	}
 	return raw, mime, nil
+}
+
+func isImagePayload(raw []byte, mime string) bool {
+	mime = strings.ToLower(strings.TrimSpace(strings.Split(mime, ";")[0]))
+	if strings.HasPrefix(mime, "image/") {
+		// Some upstreams incorrectly label an HTML error page as image/png.
+		detected := strings.ToLower(http.DetectContentType(raw))
+		return strings.HasPrefix(detected, "image/")
+	}
+	if mime == "" || mime == "application/octet-stream" {
+		return strings.HasPrefix(strings.ToLower(http.DetectContentType(raw)), "image/")
+	}
+	return false
 }
 
 func (m *Media) doJSONMap(ctx context.Context, method, endpoint string, account accounts.Account, payload map[string]any) (map[string]any, error) {
