@@ -495,6 +495,9 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 		"last_error_message",
 		"last_error_at",
 		"status_reason_code",
+		"token_refresh_next_retry_at",
+		"credential_login_next_retry_at",
+		"credential_login_error_code",
 	} {
 		updates[key] = nil
 	}

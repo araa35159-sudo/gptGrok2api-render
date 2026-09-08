@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -52,8 +53,8 @@ func (s *Server) accountAccessTokenRefresh(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 		oldToken := accountToken(account)
-		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-		result, refreshErr := s.openAIAccountClient().RefreshAccessToken(ctx, account)
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+		result, refreshErr := s.refreshAccountAccessToken(ctx, account)
 		cancel()
 		if refreshErr != nil {
 			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(refreshErr)})
@@ -177,7 +178,7 @@ func (s *Server) runAccountRefresh(progressID string, refs []string) {
 }
 
 func (s *Server) refreshOneAccount(parent context.Context, progressID, ref string) {
-	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
 	items, err := s.store.AccountList()
 	if err != nil {
@@ -196,7 +197,7 @@ func (s *Server) refreshOneAccount(parent context.Context, progressID, ref strin
 		return
 	}
 	token := accountToken(account)
-	result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
+	result, err := s.refreshAccountAccessToken(ctx, account)
 	if err != nil {
 		if updates := accountRefreshFailureUpdates(err); len(updates) > 0 {
 			_, _, _ = s.store.UpdateAccount(token, updates)
@@ -232,6 +233,82 @@ func (s *Server) openAIAccountClient() *provider.OpenAIAccountClient {
 		s.proxyManager,
 		provider.ClearanceConfig{URL: s.cfg.FlareSolverrURL, Enabled: s.cfg.ClearanceEnabled, Timeout: s.cfg.ClearanceTimeout},
 	)
+}
+
+func maxCredentialLoginConcurrency(value int) int {
+	if value < 1 {
+		return 3
+	}
+	if value > 4 {
+		return 4
+	}
+	return value
+}
+
+func accountLoginCredentials(account map[string]any) (string, string, string) {
+	return firstNonEmpty(stringValue(account["email"]), stringValue(account["username"]), stringValue(account["account_email"])),
+		firstNonEmpty(stringValue(account["login_password"]), stringValue(account["password"]), stringValue(account["account_password"])),
+		firstNonEmpty(stringValue(account["two_factor_secret"]), stringValue(account["totp_secret"]), stringValue(account["2fa_secret"]), stringValue(account["2fa"]))
+}
+
+func (s *Server) refreshAccountAccessToken(ctx context.Context, account map[string]any) (provider.AccountRefreshResult, error) {
+	oldToken := accountToken(account)
+	lockValue, _ := s.credentialLoginLocks.LoadOrStore(oldToken, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if strings.TrimSpace(stringValue(account["refresh_token"])) != "" {
+		result, err := s.openAIAccountClient().RefreshAccessToken(ctx, account)
+		if err == nil {
+			return result, nil
+		}
+		// Keep browser-session accounts usable when the stored RT is stale or
+		// belongs to a different OAuth client: verify the current AT before
+		// reporting failure. OAuth accounts still use the strict RT path.
+		if strings.EqualFold(stringValue(account["source_type"]), "chatgpt_web") {
+			if verified, verifyErr := s.openAIAccountClient().RefreshAccount(ctx, account); verifyErr == nil {
+				return verified, nil
+			}
+		}
+		email, password, totp := accountLoginCredentials(account)
+		if email == "" || password == "" || totp == "" || s.credentialLogin == nil || !s.credentialLogin.Available() {
+			return provider.AccountRefreshResult{}, err
+		}
+	}
+	email, password, totp := accountLoginCredentials(account)
+	if email == "" || password == "" || totp == "" {
+		return provider.AccountRefreshResult{}, errors.New("账号没有 refresh_token，且缺少邮箱、登录密码或 2FA 密钥")
+	}
+	if s.credentialLogin == nil || !s.credentialLogin.Available() {
+		// Older deployments can still probe the current AT. New deployments set
+		// the internal login service and take the credential-login branch below.
+		return s.openAIAccountClient().RefreshAccount(ctx, account)
+	}
+	select {
+	case s.credentialLoginSlots <- struct{}{}:
+		defer func() { <-s.credentialLoginSlots }()
+	case <-ctx.Done():
+		return provider.AccountRefreshResult{}, ctx.Err()
+	}
+	client := s.openAIAccountClient()
+	result, err := s.credentialLogin.Login(ctx, account, client.ProxyURL(account))
+	if err != nil {
+		return provider.AccountRefreshResult{}, err
+	}
+	verifiedAccount := cloneMap(account)
+	verifiedAccount["access_token"] = result.AccessToken
+	verifiedAccount["refresh_token"] = result.RefreshToken
+	verifiedAccount["id_token"] = result.IDToken
+	fields, err := client.VerifyAccessToken(ctx, verifiedAccount, result.AccessToken)
+	if err != nil {
+		return provider.AccountRefreshResult{}, fmt.Errorf("新 access token 验证失败: %w", err)
+	}
+	fields["source_type"] = firstNonEmpty(stringValue(account["source_type"]), "chatgpt_web")
+	fields["credential_login_next_retry_at"] = nil
+	fields["credential_login_error_code"] = nil
+	result.Fields = fields
+	return result, nil
 }
 
 func (s *Server) recordRefreshSuccess(progressID string) {

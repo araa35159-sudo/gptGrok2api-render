@@ -157,6 +157,15 @@ func (c *OpenAIAccountClient) RefreshAccessToken(ctx context.Context, account ma
 	return rotated, nil
 }
 
+// VerifyAccessToken validates a freshly acquired credential without attempting
+// another OAuth rotation.
+func (c *OpenAIAccountClient) VerifyAccessToken(ctx context.Context, account map[string]any, accessToken string) (map[string]any, error) {
+	if strings.TrimSpace(accessToken) == "" {
+		return nil, errors.New("access_token is required")
+	}
+	return c.fetchUserInfo(ctx, strings.TrimSpace(accessToken), account)
+}
+
 func (c *OpenAIAccountClient) fetchUserInfo(ctx context.Context, accessToken string, account map[string]any) (map[string]any, error) {
 	me, err := c.getMe(ctx, accessToken, account)
 	if err != nil {
@@ -495,6 +504,16 @@ func extractImageQuota(items []any) (int, any, bool) {
 }
 
 func tokenNeedsRefresh(token string) bool {
+	return TokenExpiresWithin(token, 24*time.Hour)
+}
+
+// TokenExpiresWithin reports whether a JWT access token expires within the
+// supplied window. Non-JWT credentials return false because they cannot be
+// safely refreshed based on an unverified timestamp.
+func TokenExpiresWithin(token string, window time.Duration) bool {
+	if window < 0 {
+		window = 0
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return false
@@ -508,7 +527,7 @@ func tokenNeedsRefresh(token string) bool {
 		return false
 	}
 	exp, ok := claims["exp"].(float64)
-	return ok && exp > 0 && time.Until(time.Unix(int64(exp), 0)) <= 24*time.Hour
+	return ok && exp > 0 && time.Until(time.Unix(int64(exp), 0)) <= window
 }
 
 func aiString(value map[string]any, keys ...string) string {

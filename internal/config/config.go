@@ -29,6 +29,9 @@ type Config struct {
 	OpenAIPlatformBaseURL  string
 	OpenAILoginTokenURL    string
 	OpenAIAgentRegisterURL string
+	OpenAILoginServiceURL  string
+	OpenAILoginServiceKey  string
+	OpenAILoginConcurrency int
 	GrokChatURL            string
 	GrokRateLimitsURL      string
 	XAICLIBaseURL          string
@@ -164,6 +167,14 @@ func Load(root string) (Config, error) {
 		imageCleanupIntervalSeconds = 60
 	}
 
+	openAILoginConcurrency := envInt("GO_OPENAI_LOGIN_CONCURRENCY", 3)
+	if openAILoginConcurrency < 1 {
+		openAILoginConcurrency = 1
+	}
+	if openAILoginConcurrency > 4 {
+		openAILoginConcurrency = 4
+	}
+
 	cfg := Config{
 		RootDir:                root,
 		ListenAddr:             env("GO_LISTEN_ADDR", env("CHATGPT2API_LISTEN_ADDR", ":8080")),
@@ -183,6 +194,9 @@ func Load(root string) (Config, error) {
 		OpenAIPlatformBaseURL:  strings.TrimRight(env("GO_OPENAI_PLATFORM_BASE_URL", "https://platform.openai.com"), "/"),
 		OpenAILoginTokenURL:    env("GO_OPENAI_LOGIN_TOKEN_URL", "https://auth.openai.com/api/accounts/oauth/token"),
 		OpenAIAgentRegisterURL: env("GO_OPENAI_AGENT_REGISTER_URL", "https://auth.openai.com/api/accounts/v1/agent/register"),
+		OpenAILoginServiceURL:  strings.TrimRight(strings.TrimSpace(os.Getenv("GO_OPENAI_LOGIN_SERVICE_URL")), "/"),
+		OpenAILoginServiceKey:  strings.TrimSpace(os.Getenv("GO_OPENAI_LOGIN_SERVICE_KEY")),
+		OpenAILoginConcurrency: openAILoginConcurrency,
 		GrokChatURL:            env("GO_GROK_CHAT_URL", "https://grok.com/rest/app-chat/conversations/new"),
 		GrokRateLimitsURL:      env("GO_GROK_RATE_LIMITS_URL", "https://grok.com/rest/rate-limits"),
 		XAICLIBaseURL:          strings.TrimRight(env("GO_XAI_CLI_BASE_URL", "https://cli-chat-proxy.grok.com/v1"), "/"),

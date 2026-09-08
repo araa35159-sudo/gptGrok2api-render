@@ -213,7 +213,10 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_PROXY_URL` | 空 | 默认代理 |
 | `GO_PROXY_POOL` | 空 | 逗号分隔代理池 |
 | `GO_OPENAI_BASE_URL` | `https://chatgpt.com` | ChatGPT 上游 |
-| `GO_VERSION` | `1.2.4-go` | 版本标识 |
+| `GO_OPENAI_LOGIN_SERVICE_URL` | 空 | 无 RT 账号的内部网页登录 AT 刷新桥接地址 |
+| `GO_OPENAI_LOGIN_SERVICE_KEY` | 空 | 内部网页登录桥接共享密钥，不应暴露给客户端 |
+| `GO_OPENAI_LOGIN_CONCURRENCY` | `3` | 无 RT 浏览器登录并发，范围 `1-4` |
+| `GO_VERSION` | `1.2.5-go` | 版本标识 |
 | `GO_IMAGE_RETENTION_DAYS` | `1` | 本地图片和元数据保留天数 |
 | `GO_IMAGE_CLEANUP_INTERVAL_SECONDS` | `3600` | 自动清理检查间隔，最少 60 秒 |
 

@@ -36,50 +36,55 @@ import (
 )
 
 type Server struct {
-	cfg                config.Config
-	auth               *auth.Validator
-	store              *store.Store
-	catalog            []model.Spec
-	client             *http.Client
-	requestClient      *http.Client
-	accountPool        *accounts.Pool
-	chatProvider       *provider.GrokChat
-	consoleProvider    *provider.ConsoleChat
-	mediaProvider      *provider.Media
-	openAIImage        *provider.OpenAIImage
-	openAIChat         *provider.OpenAIChat
-	gptMail            *provider.GPTMail
-	xaiProbe           *provider.XAIProbe
-	grokQuota          *provider.GrokQuota
-	proxyManager       *proxyruntime.Manager
-	oauthStore         *oauth.Store
-	openAILogin        *oauth.OpenAILogin
-	agentIdentityStore *agentidentity.Store
-	deviceOAuth        *oauth.DeviceService
-	taskQueue          tasks.QueueAPI
-	registerStore      *registerruntime.Store
-	registerRuntime    *registerruntime.Runtime
-	monitor            *runtimeMonitor
-	logMu              sync.Mutex
-	videoMu            sync.RWMutex
-	videoJobs          map[string]*videoJob
-	imageTaskMu        sync.RWMutex
-	imageTasks         map[string]*imageTaskState
-	imageSlots         chan struct{}
-	fileTaskMu         sync.RWMutex
-	fileTasks          map[string]*editableFileTaskState
-	schedulerMu        sync.Mutex
-	schedulerLeases    map[string]map[string]any
-	external           *externalManager
-	refreshMu          sync.RWMutex
-	refreshProgress    map[string]*accountRefreshProgress
-	survivalMu         sync.RWMutex
-	survivalStatus     map[string]any
-	survivalRunning    bool
-	survivalWake       chan struct{}
-	probeStop          chan struct{}
-	probeWake          chan struct{}
-	proxyProbeURL      string
+	cfg                  config.Config
+	auth                 *auth.Validator
+	store                *store.Store
+	catalog              []model.Spec
+	client               *http.Client
+	requestClient        *http.Client
+	accountPool          *accounts.Pool
+	chatProvider         *provider.GrokChat
+	consoleProvider      *provider.ConsoleChat
+	mediaProvider        *provider.Media
+	openAIImage          *provider.OpenAIImage
+	openAIChat           *provider.OpenAIChat
+	gptMail              *provider.GPTMail
+	xaiProbe             *provider.XAIProbe
+	grokQuota            *provider.GrokQuota
+	proxyManager         *proxyruntime.Manager
+	oauthStore           *oauth.Store
+	openAILogin          *oauth.OpenAILogin
+	agentIdentityStore   *agentidentity.Store
+	deviceOAuth          *oauth.DeviceService
+	taskQueue            tasks.QueueAPI
+	registerStore        *registerruntime.Store
+	registerRuntime      *registerruntime.Runtime
+	monitor              *runtimeMonitor
+	logMu                sync.Mutex
+	videoMu              sync.RWMutex
+	videoJobs            map[string]*videoJob
+	imageTaskMu          sync.RWMutex
+	imageTasks           map[string]*imageTaskState
+	imageSlots           chan struct{}
+	fileTaskMu           sync.RWMutex
+	fileTasks            map[string]*editableFileTaskState
+	schedulerMu          sync.Mutex
+	schedulerLeases      map[string]map[string]any
+	external             *externalManager
+	refreshMu            sync.RWMutex
+	refreshProgress      map[string]*accountRefreshProgress
+	tokenRefreshMu       sync.Mutex
+	tokenRefreshRunning  bool
+	credentialLogin      *provider.CredentialLoginClient
+	credentialLoginSlots chan struct{}
+	credentialLoginLocks sync.Map
+	survivalMu           sync.RWMutex
+	survivalStatus       map[string]any
+	survivalRunning      bool
+	survivalWake         chan struct{}
+	probeStop            chan struct{}
+	probeWake            chan struct{}
+	proxyProbeURL        string
 }
 
 func New(cfg config.Config) *Server {
@@ -101,39 +106,41 @@ func New(cfg config.Config) *Server {
 		}
 	}
 	server := &Server{
-		cfg:                cfg,
-		auth:               auth.New(cfg.APIKey, cfg.AdminKey, cfg.AuthKeysPath, cfg.AllowAnonymous, repository),
-		store:              repository,
-		catalog:            model.Catalog(),
-		client:             &http.Client{Timeout: 0},
-		requestClient:      requestClient,
-		accountPool:        accounts.New(repository),
-		chatProvider:       provider.NewGrokChat(cfg.GrokChatURL, requestClient, cfg.RequestTimeout),
-		consoleProvider:    provider.NewConsoleChat(cfg.ConsoleURL, requestClient),
-		mediaProvider:      provider.NewMedia(requestClient, cfg.MediaChatURL, cfg.MediaPostURL, cfg.AssetUploadURL, cfg.AssetsBaseURL, cfg.RequestTimeout),
-		openAIImage:        provider.NewOpenAIImage(cfg.OpenAIBaseURL, requestClient, proxyManager, cfg.RequestTimeout),
-		gptMail:            provider.NewGPTMail(requestClient),
-		xaiProbe:           provider.NewXAIProbe(cfg.XAICLIBaseURL, cfg.XAICLITokenURL, requestClient),
-		grokQuota:          provider.NewGrokQuota(cfg.GrokRateLimitsURL, requestClient, proxyManager),
-		proxyManager:       proxyManager,
-		videoJobs:          map[string]*videoJob{},
-		imageTasks:         map[string]*imageTaskState{},
-		imageSlots:         makeImageSlots(cfg.ImageMaxConcurrency),
-		fileTasks:          map[string]*editableFileTaskState{},
-		schedulerLeases:    map[string]map[string]any{},
-		external:           newExternalManager(cfg.DataDir),
-		refreshProgress:    map[string]*accountRefreshProgress{},
-		survivalStatus:     map[string]any{"running": false, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_summary": map[string]any{}, "next_run_at": ""},
-		survivalWake:       make(chan struct{}, 1),
-		probeStop:          make(chan struct{}),
-		probeWake:          make(chan struct{}, 1),
-		oauthStore:         oauth.NewStore(cfg.OAuthPath, firstNonEmpty(cfg.AdminKey, cfg.APIKey, "gptgrok2api")),
-		openAILogin:        oauth.NewOpenAILogin(cfg.OpenAIAuthBaseURL, cfg.OpenAIPlatformBaseURL, cfg.OpenAILoginTokenURL, requestClient),
-		agentIdentityStore: agentidentity.NewStore(cfg.DataDir, cfg.OpenAIAgentRegisterURL, requestClient),
-		taskQueue:          taskQueue,
-		monitor:            newRuntimeMonitor(),
-		registerStore:      registerruntime.New(cfg.RegisterPath, cfg.GrokAccountsPath),
-		registerRuntime:    registerruntime.NewRuntime(),
+		cfg:                  cfg,
+		auth:                 auth.New(cfg.APIKey, cfg.AdminKey, cfg.AuthKeysPath, cfg.AllowAnonymous, repository),
+		store:                repository,
+		catalog:              model.Catalog(),
+		client:               &http.Client{Timeout: 0},
+		requestClient:        requestClient,
+		accountPool:          accounts.New(repository),
+		chatProvider:         provider.NewGrokChat(cfg.GrokChatURL, requestClient, cfg.RequestTimeout),
+		consoleProvider:      provider.NewConsoleChat(cfg.ConsoleURL, requestClient),
+		mediaProvider:        provider.NewMedia(requestClient, cfg.MediaChatURL, cfg.MediaPostURL, cfg.AssetUploadURL, cfg.AssetsBaseURL, cfg.RequestTimeout),
+		openAIImage:          provider.NewOpenAIImage(cfg.OpenAIBaseURL, requestClient, proxyManager, cfg.RequestTimeout),
+		gptMail:              provider.NewGPTMail(requestClient),
+		xaiProbe:             provider.NewXAIProbe(cfg.XAICLIBaseURL, cfg.XAICLITokenURL, requestClient),
+		grokQuota:            provider.NewGrokQuota(cfg.GrokRateLimitsURL, requestClient, proxyManager),
+		proxyManager:         proxyManager,
+		videoJobs:            map[string]*videoJob{},
+		imageTasks:           map[string]*imageTaskState{},
+		imageSlots:           makeImageSlots(cfg.ImageMaxConcurrency),
+		fileTasks:            map[string]*editableFileTaskState{},
+		schedulerLeases:      map[string]map[string]any{},
+		external:             newExternalManager(cfg.DataDir),
+		refreshProgress:      map[string]*accountRefreshProgress{},
+		credentialLogin:      &provider.CredentialLoginClient{URL: cfg.OpenAILoginServiceURL, Key: cfg.OpenAILoginServiceKey, HTTP: &http.Client{Timeout: 3 * time.Minute}},
+		credentialLoginSlots: make(chan struct{}, maxCredentialLoginConcurrency(cfg.OpenAILoginConcurrency)),
+		survivalStatus:       map[string]any{"running": false, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_summary": map[string]any{}, "next_run_at": ""},
+		survivalWake:         make(chan struct{}, 1),
+		probeStop:            make(chan struct{}),
+		probeWake:            make(chan struct{}, 1),
+		oauthStore:           oauth.NewStore(cfg.OAuthPath, firstNonEmpty(cfg.AdminKey, cfg.APIKey, "gptgrok2api")),
+		openAILogin:          oauth.NewOpenAILogin(cfg.OpenAIAuthBaseURL, cfg.OpenAIPlatformBaseURL, cfg.OpenAILoginTokenURL, requestClient),
+		agentIdentityStore:   agentidentity.NewStore(cfg.DataDir, cfg.OpenAIAgentRegisterURL, requestClient),
+		taskQueue:            taskQueue,
+		monitor:              newRuntimeMonitor(),
+		registerStore:        registerruntime.New(cfg.RegisterPath, cfg.GrokAccountsPath),
+		registerRuntime:      registerruntime.NewRuntime(),
 	}
 	server.openAIChat = provider.NewOpenAIChat(server.openAIImage)
 	proxyManager.SetImageNodeResultCallback(server.persistProxyGroupRuntimeResult)
@@ -157,6 +164,7 @@ func New(cfg config.Config) *Server {
 		go server.imageRetentionScheduler()
 		go server.grokProbeScheduler()
 		go server.openAISurvivalScheduler()
+		go server.accountTokenRefreshScheduler()
 	}
 	return server
 }

@@ -197,6 +197,128 @@ func TestAccountRefreshAcceptsPublicAccountRef(t *testing.T) {
 	}
 }
 
+func TestAccessTokenRefreshUsesCredentialLoginAndRotatesOriginalAccount(t *testing.T) {
+	loginCalls := 0
+	loginService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginCalls++
+		if r.Header.Get("X-Internal-Key") != "login-service-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["email"] != "login@example.test" || body["password"] != "password-value" || body["totp_secret"] != "JBSWY3DPEHPK3PXP" {
+			t.Fatal("unexpected login request")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "access-new", "refresh_token": "refresh-new", "id_token": "id-new"})
+	}))
+	defer loginService.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer access-new" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/backend-api/me":
+			_ = json.NewEncoder(w).Encode(map[string]any{"email": "login@example.test", "id": "user-new"})
+		case "/backend-api/conversation/init":
+			_ = json.NewEncoder(w).Encode(map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 8}}})
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{"default": map[string]any{"account": map[string]any{"plan_type": "plus"}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	server := newAccountRefreshTestServer(t, upstream.URL)
+	server.credentialLogin.URL = loginService.URL
+	server.credentialLogin.Key = "login-service-secret"
+	_, _, _, err := server.store.AddAccounts(nil, []map[string]any{{"access_token": "access-old", "email": "login@example.test", "login_password": "password-value", "two_factor_secret": "JBSWY3DPEHPK3PXP", "group_id": "stable", "source_type": "chatgpt_web"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/refresh-at", strings.NewReader("{\"access_tokens\":[\"access-old\"]}"))
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("refresh-at returned %d", response.Code)
+	}
+	if loginCalls != 1 {
+		t.Fatalf("credential login calls = %d", loginCalls)
+	}
+	for _, secret := range []string{"password-value", "JBSWY3DPEHPK3PXP", "access-new", "refresh-new"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatal("refresh response leaked credentials")
+		}
+	}
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("original account was not preserved")
+	}
+	account := items[0]
+	if stringValue(account["access_token"]) != "access-new" || stringValue(account["refresh_token"]) != "refresh-new" || stringValue(account["id_token"]) != "id-new" {
+		t.Fatal("tokens not rotated")
+	}
+	if stringValue(account["login_password"]) != "password-value" || stringValue(account["two_factor_secret"]) != "JBSWY3DPEHPK3PXP" || stringValue(account["group_id"]) != "stable" {
+		t.Fatal("original fields not preserved")
+	}
+}
+
+func TestAccessTokenRefreshAcceptsATOnlyAndPreservesExistingRT(t *testing.T) {
+	loginService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Internal-Key") != "login-service-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "access-at-only"})
+	}))
+	defer loginService.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer access-at-only" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/backend-api/me":
+			_ = json.NewEncoder(w).Encode(map[string]any{"email": "at-only@example.test", "id": "user-at-only"})
+		case "/backend-api/conversation/init":
+			_ = json.NewEncoder(w).Encode(map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 6}}})
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{"default": map[string]any{"account": map[string]any{"plan_type": "plus"}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	server := newAccountRefreshTestServer(t, upstream.URL)
+	server.credentialLogin.URL = loginService.URL
+	server.credentialLogin.Key = "login-service-secret"
+	_, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
+		"access_token": "access-at-old", "refresh_token": "refresh-keep", "email": "at-only@example.test",
+		"login_password": "password-value", "two_factor_secret": "JBSWY3DPEHPK3PXP", "source_type": "chatgpt_web",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := runAccountRefreshForTest(t, server.Handler(), []string{"access-at-old"})
+	result, _ := progress["result"].(map[string]any)
+	if refreshed, _ := result["refreshed"].(float64); refreshed != 1 {
+		t.Fatalf("AT-only refresh failed: %#v", progress)
+	}
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("account count changed: %#v %v", items, err)
+	}
+	if stringValue(items[0]["access_token"]) != "access-at-only" || stringValue(items[0]["refresh_token"]) != "refresh-keep" {
+		t.Fatalf("AT-only rotation did not preserve RT: %#v", items[0])
+	}
+}
+
 func TestAccountRefreshMissingRefDoesNotMutateAccount(t *testing.T) {
 	server := newAccountRefreshTestServer(t, "http://127.0.0.1.invalid")
 	_, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
