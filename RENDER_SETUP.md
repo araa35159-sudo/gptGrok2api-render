@@ -20,12 +20,13 @@
 
 | 变量 | 内容 |
 | --- | --- |
-| `GO_PUBLIC_BASE_URL` | Render 分配的 `https://<service>.onrender.com` 地址 |
 | `GITHUB_BACKUP_REPO` | `用户名/gptgrok2api-data` |
 | `GITHUB_BACKUP_TOKEN` | 上一步创建的 fine-grained token |
 | `GITHUB_BACKUP_KEY` | 上一步生成的 Base64 密钥 |
 
 `CHATGPT2API_AUTH_KEY` 和 `CHATGPT2API_ADMIN_KEY` 由 Blueprint 分别生成。首次部署后，在 Render Dashboard 中查看并妥善保存。保持这两个值和 `GITHUB_BACKUP_KEY` 不变；修改加密密钥后，旧备份无法解密。
+
+图片 URL 默认使用 Render 提供的 `RENDER_EXTERNAL_URL`。如需自定义域名，可额外设置 `GO_PUBLIC_BASE_URL` 覆盖。
 
 ## 3. 数据同步行为
 

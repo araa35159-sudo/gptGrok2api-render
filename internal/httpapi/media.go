@@ -1000,7 +1000,7 @@ func collectImageEvents(reader io.Reader) []provider.ImageResult {
 }
 
 func requestPublicBase(r *http.Request) string {
-	for _, key := range []string{"GO_PUBLIC_BASE_URL", "CHATGPT2API_BASE_URL"} {
+	for _, key := range []string{"GO_PUBLIC_BASE_URL", "CHATGPT2API_BASE_URL", "RENDER_EXTERNAL_URL"} {
 		if value := normalizePublicBaseURL(os.Getenv(key)); value != "" {
 			return value
 		}

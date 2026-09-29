@@ -18,8 +18,6 @@ services:
         generateValue: true
       - key: CHATGPT2API_ADMIN_KEY
         generateValue: true
-      - key: GO_PUBLIC_BASE_URL
-        sync: false
       - key: GITHUB_BACKUP_REPO
         sync: false
       - key: GITHUB_BACKUP_TOKEN

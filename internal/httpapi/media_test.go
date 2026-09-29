@@ -149,6 +149,7 @@ func TestValidateRemoteImageURLAcceptsPublicAddress(t *testing.T) {
 func TestRequestPublicBaseDoesNotTrustPublicHostByDefault(t *testing.T) {
 	t.Setenv("GO_PUBLIC_BASE_URL", "")
 	t.Setenv("CHATGPT2API_BASE_URL", "")
+	t.Setenv("RENDER_EXTERNAL_URL", "")
 	t.Setenv("GO_TRUST_REQUEST_PUBLIC_BASE", "false")
 	request := httptest.NewRequest(http.MethodGet, "http://attacker.example/v1/images/generations", nil)
 	request.Host = "attacker.example"
@@ -164,9 +165,20 @@ func TestRequestPublicBaseDoesNotTrustPublicHostByDefault(t *testing.T) {
 func TestRequestPublicBaseUsesConfiguredPublicURL(t *testing.T) {
 	t.Setenv("GO_PUBLIC_BASE_URL", "http://23.148.212.231:8000/")
 	t.Setenv("CHATGPT2API_BASE_URL", "")
+	t.Setenv("RENDER_EXTERNAL_URL", "")
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/v1/images/generations", nil)
 	if value := requestPublicBase(request); value != "http://23.148.212.231:8000" {
 		t.Fatalf("expected configured public base, got %q", value)
+	}
+}
+
+func TestRequestPublicBaseUsesRenderURL(t *testing.T) {
+	t.Setenv("GO_PUBLIC_BASE_URL", "")
+	t.Setenv("CHATGPT2API_BASE_URL", "")
+	t.Setenv("RENDER_EXTERNAL_URL", "https://gptgrok2api-render.onrender.com")
+	request := httptest.NewRequest(http.MethodGet, "http://internal:10000/v1/images/generations", nil)
+	if value := requestPublicBase(request); value != "https://gptgrok2api-render.onrender.com" {
+		t.Fatalf("expected Render public base, got %q", value)
 	}
 }
 
