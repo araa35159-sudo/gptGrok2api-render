@@ -161,6 +161,11 @@ func New(cfg config.Config) *Server {
 	return server
 }
 
+// FlushPersistentState writes pending account feedback before a final backup.
+func (s *Server) FlushPersistentState() error {
+	return s.store.FlushAccounts()
+}
+
 func runtimeProxyGroups(groups []config.ProxyGroup) []proxyruntime.GroupConfig {
 	result := make([]proxyruntime.GroupConfig, 0, len(groups))
 	for _, group := range groups {

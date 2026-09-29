@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: gptgrok2api-render
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: GO_LISTEN_ADDR
+        value: :10000
+      - key: GO_QUEUE_BACKEND
+        value: json
+      - key: GO_IMAGE_MAX_CONCURRENCY
+        value: "2"
+      - key: GO_IMAGE_ACCOUNT_CONCURRENCY
+        value: "1"
+      - key: CHATGPT2API_AUTH_KEY
+        generateValue: true
+      - key: CHATGPT2API_ADMIN_KEY
+        generateValue: true
+      - key: GO_PUBLIC_BASE_URL
+        sync: false
+      - key: GITHUB_BACKUP_REPO
+        sync: false
+      - key: GITHUB_BACKUP_TOKEN
+        sync: false
+      - key: GITHUB_BACKUP_KEY
+        sync: false
