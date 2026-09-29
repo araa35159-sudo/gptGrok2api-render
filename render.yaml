@@ -19,7 +19,7 @@ services:
       - key: CHATGPT2API_ADMIN_KEY
         generateValue: true
       - key: GITHUB_BACKUP_REPO
-        sync: false
+        value: araa35159-sudo/gptgrok2api-data
       - key: GITHUB_BACKUP_TOKEN
         sync: false
       - key: GITHUB_BACKUP_KEY

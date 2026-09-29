@@ -6,7 +6,7 @@
 
 在自己的 GitHub 账号下另建一个**私有**仓库，例如 `gptgrok2api-data`，初始化 `main` 分支。数据仓库必须与部署源码仓库分开，避免备份提交触发 Render 重新部署。
 
-创建仅对数据仓库有访问权的 fine-grained personal access token，授予 **Contents: Read and write**。生成 32 字节加密密钥：
+创建仅对 `araa35159-sudo/gptgrok2api-data` 有访问权的 fine-grained personal access token，授予 **Contents: Read and write**。生成 32 字节加密密钥：
 
 ```powershell
 [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
@@ -20,11 +20,12 @@
 
 | 变量 | 内容 |
 | --- | --- |
-| `GITHUB_BACKUP_REPO` | `用户名/gptgrok2api-data` |
 | `GITHUB_BACKUP_TOKEN` | 上一步创建的 fine-grained token |
 | `GITHUB_BACKUP_KEY` | 上一步生成的 Base64 密钥 |
 
 `CHATGPT2API_AUTH_KEY` 和 `CHATGPT2API_ADMIN_KEY` 由 Blueprint 分别生成。首次部署后，在 Render Dashboard 中查看并妥善保存。保持这两个值和 `GITHUB_BACKUP_KEY` 不变；修改加密密钥后，旧备份无法解密。
+
+`GITHUB_BACKUP_REPO` 已在 Blueprint 中设为 `araa35159-sudo/gptgrok2api-data`，不需要重复填写。
 
 图片 URL 默认使用 Render 提供的 `RENDER_EXTERNAL_URL`。如需自定义域名，可额外设置 `GO_PUBLIC_BASE_URL` 覆盖。
 
