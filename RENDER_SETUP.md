@@ -4,7 +4,7 @@
 
 ## 1. 准备 GitHub 数据仓库
 
-在自己的 GitHub 账号下另建一个**私有**仓库，例如 `gptgrok2api-data`，初始化 `main` 分支。数据仓库必须与部署源码仓库分开，避免备份提交触发 Render 重新部署。
+此 fork 已配套创建**私有**数据仓库 [`araa35159-sudo/gptgrok2api-data`](https://github.com/araa35159-sudo/gptgrok2api-data)，并初始化 `main` 分支。数据仓库与部署源码仓库分开，备份提交不会触发 Render 重新部署。
 
 创建仅对 `araa35159-sudo/gptgrok2api-data` 有访问权的 fine-grained personal access token，授予 **Contents: Read and write**。生成 32 字节加密密钥：
 
