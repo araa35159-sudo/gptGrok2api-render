@@ -35,7 +35,7 @@ flowchart LR
 
 ## Docker 快速开始
 
-Render 免费实例部署及 GitHub 加密 JSON 备份见 [RENDER_SETUP.md](./RENDER_SETUP.md)。
+Render 免费实例部署及 GitHub 加密 JSON 备份见 [RENDER_SETUP.md](./RENDER_SETUP.md)。Railway 部署见 [RAILWAY_SETUP.md](./RAILWAY_SETUP.md)。
 
 要求 Docker Engine 24+、Docker Compose v2，以及能够访问 ChatGPT/Grok 的网络出口。
 

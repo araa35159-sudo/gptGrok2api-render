@@ -151,7 +151,7 @@ func Load(root string) (Config, error) {
 
 	cfg := Config{
 		RootDir:                root,
-		ListenAddr:             env("GO_LISTEN_ADDR", env("CHATGPT2API_LISTEN_ADDR", ":8080")),
+		ListenAddr:             env("GO_LISTEN_ADDR", env("CHATGPT2API_LISTEN_ADDR", ":"+env("PORT", "8080"))),
 		DataDir:                resolvePath(root, env("GROK_DATA_DIR", "data")),
 		StaticDir:              resolvePath(root, env("GO_STATIC_DIR", "web_dist")),
 		ConfigPath:             resolvePath(root, env("GO_CONFIG_PATH", "config.json")),

@@ -1005,6 +1005,11 @@ func requestPublicBase(r *http.Request) string {
 			return value
 		}
 	}
+	if domain := strings.TrimSpace(os.Getenv("RAILWAY_PUBLIC_DOMAIN")); domain != "" {
+		if value := normalizePublicBaseURL("https://" + domain); value != "" {
+			return value
+		}
+	}
 	trustRequestHeaders := trustRequestPublicBase()
 	if trustRequestHeaders {
 		if value := normalizePublicBaseURL(r.Header.Get("X-Public-Base-URL")); value != "" {

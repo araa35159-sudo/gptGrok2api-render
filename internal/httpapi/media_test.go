@@ -182,6 +182,17 @@ func TestRequestPublicBaseUsesRenderURL(t *testing.T) {
 	}
 }
 
+func TestRequestPublicBaseUsesRailwayDomain(t *testing.T) {
+	t.Setenv("GO_PUBLIC_BASE_URL", "")
+	t.Setenv("CHATGPT2API_BASE_URL", "")
+	t.Setenv("RENDER_EXTERNAL_URL", "")
+	t.Setenv("RAILWAY_PUBLIC_DOMAIN", "gptgrok2api.up.railway.app")
+	request := httptest.NewRequest(http.MethodGet, "http://internal:8080/v1/images/generations", nil)
+	if value := requestPublicBase(request); value != "https://gptgrok2api.up.railway.app" {
+		t.Fatalf("expected Railway public base, got %q", value)
+	}
+}
+
 func TestUpstreamStatusUnwrapsWrappedErrors(t *testing.T) {
 	err := fmt.Errorf("do request failed /v1/chat/completions: %w", &protocol.UpstreamError{Status: http.StatusTooManyRequests, Message: "throttled"})
 	if status := upstreamStatus(err); status != http.StatusTooManyRequests {

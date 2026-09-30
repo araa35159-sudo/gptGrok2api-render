@@ -26,11 +26,10 @@ COPY VERSION CHANGELOG.md config.example.yaml ./
 COPY services/default_prompt_library.json /app/services/default_prompt_library.json
 RUN mkdir -p /app/data /app/logs && chown -R app:app /app
 USER app
-ENV GO_LISTEN_ADDR=:80 \
-    GO_STATIC_DIR=/app/web_dist \
+ENV GO_STATIC_DIR=/app/web_dist \
     GO_CONFIG_PATH=/app/data/config.json \
     GO_AUTH_KEYS_PATH=/app/data/auth_keys.json \
     GROK_DATA_DIR=/app/data \
     GO_QUEUE_BACKEND=json
-EXPOSE 80
+EXPOSE 8080
 ENTRYPOINT ["/app/gptgrok2api"]
