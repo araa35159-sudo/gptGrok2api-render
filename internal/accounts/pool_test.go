@@ -59,6 +59,33 @@ func TestPoolFeedbackHonorsUpstreamRetryWindow(t *testing.T) {
 	}
 }
 
+func TestPoolCanceledRequestDoesNotCoolAccount(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "pool": "basic", "enabled": true, "status": "正常"}}); err != nil {
+		t.Fatal(err)
+	}
+	pool := New(repository)
+	lease, err := pool.Reserve(context.Background(), []string{"basic"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Release(lease)
+	pool.Feedback(lease.Account, 502, fmt.Errorf("upstream stopped: %w", context.Canceled))
+	again, err := pool.Reserve(context.Background(), []string{"basic"}, nil)
+	if err != nil {
+		t.Fatalf("canceled request made healthy account unavailable: %v", err)
+	}
+	pool.Release(again)
+	items, err := repository.AccountList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0]["last_error_kind"] != nil {
+		t.Fatalf("canceled request persisted an account failure: %#v", items[0])
+	}
+}
+
 func TestPoolFeedbackInvokesInvalidCallbackOnlyForAuthFailures(t *testing.T) {
 	root := t.TempDir()
 	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))

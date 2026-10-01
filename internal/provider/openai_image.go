@@ -204,11 +204,12 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	// conversation ID is available always resolve the final conversation.
 	if conversationID != "" {
 		stageStarted = time.Now()
+		notifyOpenAIImageStage(ctx, "poll_started", stageStarted)
 		imageRefs, err = o.pollConversation(ctx, account, conversationID)
+		notifyOpenAIImageStage(ctx, "resolve_ms", stageStarted)
 		if err != nil {
 			return nil, err
 		}
-		notifyOpenAIImageStage(ctx, "resolve_ms", stageStarted)
 	}
 	if len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image generation completed without image files")
@@ -561,14 +562,22 @@ func (o *OpenAIImage) start(ctx context.Context, account accounts.Account, requi
 	defer response.Body.Close()
 	conversationID := ""
 	fileIDs := []string{}
+	var terminalErr error
 	err = scanOpenAISSE(response.Body, func(raw []byte) bool {
 		var value any
 		if json.Unmarshal(raw, &value) != nil {
 			return false
 		}
 		collectOpenAIImageRefs(value, &conversationID, &fileIDs)
+		terminalErr = openAIImageExplicitTerminalError(value)
+		if terminalErr != nil {
+			return true
+		}
 		return false
 	})
+	if terminalErr != nil {
+		return "", nil, terminalErr
+	}
 	if err != nil {
 		return "", nil, err
 	}
@@ -682,6 +691,42 @@ func openAIImagePollErrorSummary(err error) string {
 }
 
 func openAIImageTerminalError(value any) error {
+	if err := openAIImageExplicitTerminalError(value); err != nil {
+		return err
+	}
+	root, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	// Only the current assistant turn can prove that generation has ended.
+	// Completed user/tool messages and earlier conversation branches do not.
+	mapping, _ := root["mapping"].(map[string]any)
+	node, _ := mapping[stringValue(root["current_node"])].(map[string]any)
+	message, _ := node["message"].(map[string]any)
+	author, _ := message["author"].(map[string]any)
+	if stringValue(author["role"]) != "assistant" || message["end_turn"] != true ||
+		stringValue(message["status"]) != "finished_successfully" {
+		return nil
+	}
+	content, _ := message["content"].(map[string]any)
+	if stringValue(content["content_type"]) != "text" {
+		return nil
+	}
+	parts, _ := content["parts"].([]any)
+	texts := []string{}
+	for _, part := range parts {
+		if text, ok := part.(string); ok && strings.TrimSpace(text) != "" {
+			texts = append(texts, text)
+		}
+	}
+	if len(texts) == 0 {
+		return nil
+	}
+	reason := "upstream finished without an image: " + truncateOpenAIImageReason(strings.Join(texts, " "))
+	return &protocol.UpstreamError{Status: http.StatusUnprocessableEntity, Message: reason, Body: reason}
+}
+
+func openAIImageExplicitTerminalError(value any) error {
 	reason := openAIImageTerminalReason(value)
 	if reason == "" {
 		return nil
@@ -693,6 +738,25 @@ func openAIImageTerminalError(value any) error {
 func openAIImageTerminalReason(value any) string {
 	switch typed := value.(type) {
 	case map[string]any:
+		// v1 SSE updates can replace a single metadata field rather than send
+		// a complete message object.
+		if path := firstStringValue(typed, "p", "path"); strings.Contains(path, "/") {
+			item, exists := typed["v"]
+			if !exists {
+				item, exists = typed["value"]
+			}
+			if exists {
+				field := path[strings.LastIndex(path, "/")+1:]
+				if reason := openAIImageTerminalReason(map[string]any{field: item}); reason != "" {
+					return reason
+				}
+			}
+		}
+		if mapping, ok := typed["mapping"].(map[string]any); ok {
+			if current := stringValue(typed["current_node"]); current != "" {
+				return openAIImageTerminalReason(mapping[current])
+			}
+		}
 		for key, item := range typed {
 			normalizedKey := strings.ToLower(strings.TrimSpace(key))
 			text := strings.ToLower(strings.TrimSpace(stringValue(item)))
@@ -707,7 +771,21 @@ func openAIImageTerminalReason(value any) string {
 				case "refusal", "content_filter", "safety", "moderation":
 					return text
 				}
+			case "is_blocked", "is_refusal", "is_rejected", "is_moderated", "blocked", "refused":
+				if item == true {
+					return normalizedKey
+				}
+			case "refusal", "image_generation_error":
+				if message, ok := item.(string); ok && strings.TrimSpace(message) != "" {
+					return truncateOpenAIImageReason(message)
+				}
+				if item == true {
+					return normalizedKey
+				}
 			case "error":
+				if item == nil || item == false {
+					continue
+				}
 				if details, ok := item.(map[string]any); ok {
 					if message := firstStringValue(details, "message", "code", "type"); message != "" {
 						return truncateOpenAIImageReason(message)
@@ -734,8 +812,9 @@ func openAIImageTerminalReason(value any) string {
 
 func truncateOpenAIImageReason(value string) string {
 	value = strings.Join(strings.Fields(value), " ")
-	if len(value) > 160 {
-		return value[:160]
+	runes := []rune(value)
+	if len(runes) > 160 {
+		return string(runes[:160])
 	}
 	return value
 }

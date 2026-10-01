@@ -909,8 +909,10 @@ func responseImageOutputs(raw []byte) []map[string]string {
 
 func monitorStageLabel(stage string) string {
 	switch strings.ToLower(strings.TrimSpace(stage)) {
-	case "handler_submitted":
+	case "handler_submitted", "handler_queue_waiting":
 		return "等待入口"
+	case "handler_queue_done":
+		return "入口就绪"
 	case "handler_started":
 		return "入口执行"
 	case "stream_first_item":

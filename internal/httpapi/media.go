@@ -207,11 +207,15 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 			}
 			defer releaseSlot()
 			excluded := map[string]bool{}
+			var lastErr error
 			for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 				accountStarted := time.Now()
-				s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
+				s.stageRequestMonitor(r, "image_getting_account", 35, nil)
 				lease, reserveErr := s.accountPool.ReserveMatchingLimit(ctx, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
 				if reserveErr != nil {
+					if errors.Is(reserveErr, accounts.ErrUnavailable) && lastErr != nil {
+						reserveErr = lastErr
+					}
 					sendErr(reserveErr)
 					cancel()
 					return
@@ -222,8 +226,14 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
 				if generateErr != nil {
 					s.accountPool.Release(lease)
+					if errors.Is(generateErr, context.Canceled) || ctx.Err() != nil {
+						sendErr(generateErr)
+						cancel()
+						return
+					}
 					s.accountPool.Feedback(lease.Account, upstreamStatus(generateErr), generateErr)
 					excluded[lease.Account.Token] = true
+					lastErr = generateErr
 					if s.shouldRetry(upstreamStatus(generateErr), attempt) {
 						continue
 					}
@@ -249,8 +259,14 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				}
 				if resolveErr != nil {
 					s.accountPool.Release(lease)
+					if errors.Is(resolveErr, context.Canceled) || ctx.Err() != nil {
+						sendErr(resolveErr)
+						cancel()
+						return
+					}
 					s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
 					excluded[lease.Account.Token] = true
+					lastErr = resolveErr
 					if s.shouldRetry(upstreamStatus(resolveErr), attempt) {
 						continue
 					}
@@ -267,17 +283,20 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		}()
 	}
 	wg.Wait()
-	select {
-	case err := <-errCh:
-		return nil, err
-	default:
-	}
 	data := make([]map[string]string, 0)
 	for _, items := range results {
 		data = append(data, items...)
 	}
 	if len(data) == 0 {
+		select {
+		case err := <-errCh:
+			return nil, err
+		default:
+		}
 		return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
+	}
+	if len(data) < count {
+		s.enrichRequestMonitor(r, map[string]any{"partial_results": true, "requested_count": count, "completed_count": len(data)})
 	}
 	if len(data) > count {
 		data = data[:count]
@@ -849,6 +868,10 @@ func (s *Server) monitorOpenAIImageContext(r *http.Request, ctx context.Context)
 		return ctx
 	}
 	ctx = provider.WithOpenAIImageStage(ctx, func(metric string, elapsed time.Duration) {
+		if metric == "poll_started" {
+			s.stageRequestMonitor(r, "image_resolving", 85, nil)
+			return
+		}
 		stages := map[string]struct {
 			name     string
 			progress int

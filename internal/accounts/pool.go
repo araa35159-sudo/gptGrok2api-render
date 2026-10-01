@@ -162,6 +162,11 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 	if account.Token == "" {
 		return
 	}
+	// Cancellations and rejected image content say nothing about account health.
+	// Neither should put an otherwise usable account on cooldown.
+	if errors.Is(err, context.Canceled) || status == 422 {
+		return
+	}
 	p.mu.Lock()
 	if status >= 200 && status < 300 {
 		delete(p.cooldowns, account.Token)

@@ -179,9 +179,11 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	s.stageRequestMonitor(r, "image_getting_account", 35, nil)
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 		accountStarted := time.Now()
-		lease, err := s.accountPool.ReserveMatchingLimit(r.Context(), []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
+		lease, err := s.accountPool.ReserveMatchingLimit(imageContext, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
 		if err != nil {
-			lastErr = err
+			if !errors.Is(err, accounts.ErrUnavailable) || lastErr == nil {
+				lastErr = err
+			}
 			break
 		}
 		s.enrichMonitorAccount(r, lease.Account)
@@ -190,6 +192,10 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		selected = lease.Account
 		s.accountPool.Release(lease)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || imageContext.Err() != nil {
+				lastErr = err
+				break
+			}
 			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 			excluded[lease.Account.Token] = true
 			lastErr = err

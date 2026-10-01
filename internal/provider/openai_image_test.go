@@ -298,6 +298,73 @@ func TestOpenAIImageTerminalErrorRecognizesUpstreamModeration(t *testing.T) {
 	}
 }
 
+func TestOpenAIImageStreamStopsOnRefusalWithoutWaitingForEOF(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"conversation_id\":\"blocked-image\",\"message\":{\"metadata\":{\"is_refusal\":true}}}\n\n")
+		w.(http.Flusher).Flush()
+		// Leave the stream open: recognizing the event must close the body.
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	client := NewOpenAIImage(upstream.URL, upstream.Client(), nil, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, err := client.start(ctx, accounts.Account{}, openAIRequirements{}, "", "test", "gpt-image-2.5", "1024x1024", "auto", nil)
+	var stopped *protocol.UpstreamError
+	if !errors.As(err, &stopped) || stopped.Status != http.StatusUnprocessableEntity {
+		t.Fatalf("stream waited instead of stopping on refusal: %v", err)
+	}
+}
+
+func TestOpenAIImagePollingStopsOnFinishedTextReply(t *testing.T) {
+	var polls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		polls.Add(1)
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"current_node":"final","mapping":{"final":{"message":{"author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"content":{"content_type":"text","parts":["The image request was rejected."]}}}}}`))}, nil
+	})}
+	imageClient := NewOpenAIImage("https://example.invalid", client, nil, 50*time.Millisecond)
+	_, err := imageClient.pollConversation(context.Background(), accounts.Account{}, "finished-image")
+	var stopped *protocol.UpstreamError
+	if !errors.As(err, &stopped) || stopped.Status != http.StatusUnprocessableEntity || !strings.Contains(err.Error(), "request was rejected") {
+		t.Fatalf("finished text reply was not surfaced: %v", err)
+	}
+	if polls.Load() != 1 {
+		t.Fatalf("polled a finished reply %d times", polls.Load())
+	}
+}
+
+func TestOpenAIImageTerminalErrorIgnoresUnfinishedTurnAndOldBranch(t *testing.T) {
+	var value any
+	if err := json.Unmarshal([]byte(`{"current_node":"active","mapping":{"old":{"message":{"status":"blocked"}},"active":{"message":{"author":{"role":"assistant"},"status":"in_progress","end_turn":false,"content":{"content_type":"text","parts":["Generating your image."]}}}}}`), &value); err != nil {
+		t.Fatal(err)
+	}
+	if err := openAIImageTerminalError(value); err != nil {
+		t.Fatalf("unfinished current turn was stopped by old branch: %v", err)
+	}
+}
+
+func TestOpenAIImageTerminalFlagsAndPatches(t *testing.T) {
+	for _, tc := range []struct {
+		payload string
+		stopped bool
+	}{
+		{`{"o":"replace","p":"/message/metadata/is_refusal","v":true}`, true},
+		{`{"metadata":{"is_refusal":false},"error":false}`, false},
+		{`{"o":"replace","p":"/message/metadata/is_refusal","v":false}`, false},
+		{`{"message":{"content":{"content_type":"refusal"}}}`, true},
+		{`{"message":{"metadata":{"refusal":"Image rejected by upstream."}}}`, true},
+	} {
+		var value any
+		if err := json.Unmarshal([]byte(tc.payload), &value); err != nil {
+			t.Fatal(err)
+		}
+		if stopped := openAIImageTerminalError(value) != nil; stopped != tc.stopped {
+			t.Errorf("terminal detection for %s = %v, want %v", tc.payload, stopped, tc.stopped)
+		}
+	}
+}
+
 func TestOpenAIImageProxyFailureExcludesProviderServerErrors(t *testing.T) {
 	if openAIImageProxyFailure(&protocol.UpstreamError{Status: http.StatusInternalServerError, Message: "provider unavailable"}) {
 		t.Fatal("provider HTTP 500 was attributed to the proxy")

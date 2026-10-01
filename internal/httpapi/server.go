@@ -227,6 +227,9 @@ func (s *Server) acquireImageSlot(ctx context.Context, r *http.Request) (func(),
 		return func() {}, nil
 	}
 	started := time.Now()
+	if r != nil {
+		s.stageRequestMonitor(r, "handler_queue_waiting", 10, nil)
+	}
 	select {
 	case s.imageSlots <- struct{}{}:
 		waited := time.Since(started)
@@ -1101,7 +1104,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, request prot
 }
 
 func (s *Server) shouldRetry(status, attempt int) bool {
-	return attempt < s.cfg.ChatMaxRetries && s.cfg.ChatRetryCodes[status]
+	return status != http.StatusUnprocessableEntity && attempt < s.cfg.ChatMaxRetries && s.cfg.ChatRetryCodes[status]
 }
 
 func writeSSE(w http.ResponseWriter, value any) {
