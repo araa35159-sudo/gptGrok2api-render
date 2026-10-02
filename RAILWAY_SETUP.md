@@ -17,10 +17,10 @@
 | `GITHUB_BACKUP_REPO` | `araa35159-sudo/gptgrok2api-data` |
 | `GITHUB_BACKUP_TOKEN` | 仅授权上述私有仓库 `Contents: Read and write` 的 fine-grained GitHub token |
 | `GITHUB_BACKUP_KEY` | 32 字节随机值的 Base64 编码；后续必须保持不变 |
-| `GO_IMAGE_MAX_CONCURRENCY` | `4` |
-| `GO_IMAGE_ACCOUNT_CONCURRENCY` | `2` |
+| `GO_IMAGE_MAX_CONCURRENCY` | `16` |
+| `GO_IMAGE_ACCOUNT_CONCURRENCY` | `16` |
 
-总图片并发先设为 4，每账号并发先设为 2。只有一个可用 ChatGPT 账号时，实际最多同时生成 2 张；两个或更多可用账号时最多 4 张。修改这两个变量后点击 Railway 的 Deploy 应用；旧服务的 2/1 变量会覆盖代码默认值，更新代码不会自动修改它们。遇到上游 429 时降低每账号并发；并发增加主要缩短排队，不会直接缩短单张图片的上游生成时间。
+总图片并发与每账号并发均设为 16，只有一个可用 ChatGPT 账号时也允许最多同时处理 16 张。修改这两个变量后点击 Railway 的 Deploy 应用；旧服务的 2/1 或 4/2 变量会覆盖代码默认值，更新代码不会自动修改它们。第 17 张及以后的图片会排队等待名额。上游账号仍可能返回 429，并发增加主要缩短本地排队，不会直接缩短单张图片的上游生成时间。
 
 Windows PowerShell 可用以下命令分别生成随机值：
 

@@ -123,14 +123,14 @@ func Load(root string) (Config, error) {
 	if chatMaxRetries > 3 {
 		chatMaxRetries = 3
 	}
-	imageAccountConcurrency := envInt("GO_IMAGE_ACCOUNT_CONCURRENCY", 1)
+	imageAccountConcurrency := envInt("GO_IMAGE_ACCOUNT_CONCURRENCY", 16)
 	if imageAccountConcurrency < 1 {
 		imageAccountConcurrency = 1
 	}
-	if imageAccountConcurrency > 4 {
-		imageAccountConcurrency = 4
+	if imageAccountConcurrency > 16 {
+		imageAccountConcurrency = 16
 	}
-	imageMaxConcurrency := envInt("GO_IMAGE_MAX_CONCURRENCY", 128)
+	imageMaxConcurrency := envInt("GO_IMAGE_MAX_CONCURRENCY", 16)
 	if imageMaxConcurrency < 1 {
 		imageMaxConcurrency = 1
 	}

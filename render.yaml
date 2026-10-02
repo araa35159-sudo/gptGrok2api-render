@@ -11,9 +11,9 @@ services:
       - key: GO_QUEUE_BACKEND
         value: json
       - key: GO_IMAGE_MAX_CONCURRENCY
-        value: "2"
+        value: "16"
       - key: GO_IMAGE_ACCOUNT_CONCURRENCY
-        value: "1"
+        value: "16"
       - key: CHATGPT2API_AUTH_KEY
         generateValue: true
       - key: CHATGPT2API_ADMIN_KEY
